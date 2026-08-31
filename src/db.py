@@ -1,40 +1,59 @@
 """
-MongoDB storage layer.
+MongoDB storage layer — Product Intelligence + LIMS Backend.
 
-Persists every successful extraction into:
-    host       : localhost:27017 (configurable via MONGO_URI)
-    database   : Competition_intelligence
-    collection : Product_data
+Collections
+-----------
+product_data          : Immutable extraction snapshots (one per upload/scan).
+product_info          : Lightweight deduplicated product index (one per real product).
+lims_sc               : LIMS sample containers (read-only).
+lims_pg               : LIMS parameter groups (read-only).
+lims_pa               : LIMS parameter analyses / results (read-only).
+fs.files / fs.chunks  : GridFS image storage.
 
-Storage is best-effort: if MongoDB is unreachable the caller still gets
-its extraction result — save_product_data() logs a warning and returns None.
+Storage is best-effort: if MongoDB is unreachable callers still get their
+extraction result — save_product_data() logs a warning and returns None.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
-from gridfs import GridFSBucket
 from bson import ObjectId
 from bson.errors import InvalidId
+from gridfs import GridFSBucket
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import PyMongoError
 
 # ── Configuration (env-overridable) ─────────────────────────────────────────
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.environ.get("MONGO_DB", "Competition_intelligence")
-MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "Product_data")
 
-# Server selection timeout kept short so API responses aren't hung up for
-# 30s when Mongo is down — fail fast and warn instead.
+# product_data — immutable extraction snapshots
+PRODUCT_DATA_COLLECTION = os.environ.get("PRODUCT_DATA_COLLECTION", "product_data")
+
+# product_info — lightweight deduplicated product index
+PRODUCT_INFO_COLLECTION = os.environ.get("PRODUCT_INFO_COLLECTION", "product_info")
+
+# LIMS collections (read-only; already exist in the database)
+LIMS_SC_COLLECTION = os.environ.get("LIMS_SC_COLLECTION", "lims_sc")
+LIMS_PG_COLLECTION = os.environ.get("LIMS_PG_COLLECTION", "lims_pg")
+LIMS_PA_COLLECTION = os.environ.get("LIMS_PA_COLLECTION", "lims_pa")
+
+# Kept for backward-compat with CLI usage (console output only)
+MONGO_COLLECTION = PRODUCT_DATA_COLLECTION
+
+# Server selection timeout: fail fast when Mongo is down
 SERVER_SELECTION_TIMEOUT_MS = int(os.environ.get("MONGO_TIMEOUT_MS", "3000"))
 
 _client: Optional[MongoClient] = None
 _bucket = None
 
+
+# ── Internal helpers ─────────────────────────────────────────────────────────
 
 def _get_client() -> MongoClient:
     """Lazy singleton MongoClient."""
@@ -48,17 +67,52 @@ def _get_client() -> MongoClient:
 
 
 def _get_bucket() -> GridFSBucket:
-    """Lazy singleton GridFSBucket for storing image files."""
+    """Lazy singleton GridFSBucket for image files."""
     global _bucket
     if _bucket is None:
         _bucket = GridFSBucket(_get_client()[MONGO_DB])
     return _bucket
 
 
-def get_collection():
-    """Return the Product_data collection handle (does not connect yet)."""
-    return _get_client()[MONGO_DB][MONGO_COLLECTION]
+def _col(name: str):
+    """Return a collection handle."""
+    return _get_client()[MONGO_DB][name]
 
+
+def _now_iso() -> str:
+    """Return current UTC time as ISO-8601 string with Z suffix."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase + strip for fuzzy matching."""
+    return (text or "").lower().strip()
+
+
+def _mongo_doc_to_json(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively convert ObjectId / datetime values to strings for JSON output."""
+    if doc is None:
+        return {}
+    result = {}
+    for k, v in doc.items():
+        if isinstance(v, ObjectId):
+            result[k] = str(v)
+        elif isinstance(v, datetime):
+            result[k] = v.strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif isinstance(v, dict):
+            result[k] = _mongo_doc_to_json(v)
+        elif isinstance(v, list):
+            result[k] = [
+                _mongo_doc_to_json(i) if isinstance(i, dict) else
+                (str(i) if isinstance(i, (ObjectId, datetime)) else i)
+                for i in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
+# ── GridFS image storage ─────────────────────────────────────────────────────
 
 def save_image(
     data: bytes,
@@ -67,9 +121,7 @@ def save_image(
 ) -> Optional[str]:
     """
     Store an image in MongoDB GridFS.
-
-    Returns the GridFS file id as a string, or None on failure
-    (warning printed to stderr).
+    Returns the GridFS file id as a string, or None on failure.
     """
     try:
         file_id = _get_bucket().upload_from_stream(
@@ -90,9 +142,7 @@ def save_image(
 def get_image(image_id: str) -> Optional[Dict[str, Any]]:
     """
     Fetch a stored image by GridFS id.
-
-    Returns {"data": bytes, "filename": str, "content_type": str}
-    or None if not found / invalid id / Mongo unreachable.
+    Returns {data, filename, content_type} or None.
     """
     try:
         oid = ObjectId(image_id)
@@ -115,6 +165,8 @@ def get_image(image_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# ── product_data (immutable, append-only) ────────────────────────────────────
+
 def save_product_data(
     result: Dict[str, Any],
     *,
@@ -122,9 +174,9 @@ def save_product_data(
     image_filenames: List[Optional[str]],
     source: str,
     image_refs: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
+) -> Optional[Tuple[str, str]]:
     """
-    Persist an extraction result to MongoDB.
+    Persist an extraction result to the ``product_data`` collection.
 
     Parameters
     ----------
@@ -132,34 +184,47 @@ def save_product_data(
         The extracted product data (as returned by extract_product_data).
     model : str
         The OpenAI model used for the extraction.
-    image_filenames : list of str or None
+    image_filenames : list of str
         Original uploaded file names.
     source : str
-        Where this extraction came from ("api" or "cli").
+        ``"api"`` or ``"cli"``.
     image_refs : list of dict, optional
-        GridFS references for the stored images:
-        [{filename, content_type, size, gridfs_id}, ...]
+        GridFS references for the stored images.
 
     Returns
     -------
-    str or None
-        The inserted document's _id as a string, or None if storage failed
-        (a warning is printed to stderr in that case).
+    (product_data_id, analyzed_at) or None
+        product_data_id is the string ``_id`` of the inserted document.
+        analyzed_at is the UTC ISO-8601 timestamp string.
+        Returns None if storage failed (warning printed to stderr).
     """
     try:
-        document = {
-            **result,
-            "metadata": {
-                "model": model,
-                "image_filenames": [f for f in image_filenames if f],
-                "source": source,
-                "created_at": datetime.now(timezone.utc),
-            },
+        analyzed_at = _now_iso()
+        # Use the timestamp already embedded by the extractor if present,
+        # otherwise fall back to the one we just computed.
+        analyzed_at = result.get("extracted_at") or analyzed_at
+
+        metadata: Dict[str, Any] = {
+            "model": model,
+            "image_filenames": [f for f in image_filenames if f],
+            "source": source,
+            "created_at": datetime.now(timezone.utc),
         }
         if image_refs:
-            document["metadata"]["images"] = image_refs
-        inserted = get_collection().insert_one(document)
-        return str(inserted.inserted_id)
+            metadata["images"] = image_refs
+
+        # Build the document — full extracted payload + top-level analyzed_at
+        # Strip any legacy top-level keys that we now hoist
+        doc_payload = {k: v for k, v in result.items() if k not in ("extracted_at", "metadata")}
+        document: Dict[str, Any] = {
+            **doc_payload,
+            "analyzed_at": analyzed_at,
+            "metadata": metadata,
+        }
+
+        inserted = _col(PRODUCT_DATA_COLLECTION).insert_one(document)
+        product_data_id = str(inserted.inserted_id)
+        return product_data_id, analyzed_at
     except PyMongoError as exc:
         print(
             f"[mongodb] WARNING: could not store result "
@@ -167,3 +232,632 @@ def save_product_data(
             file=sys.stderr,
         )
         return None
+
+
+def get_product_data(product_data_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch a single product_data document by its _id string."""
+    try:
+        oid = ObjectId(product_data_id)
+        doc = _col(PRODUCT_DATA_COLLECTION).find_one({"_id": oid})
+        if doc is None:
+            return None
+        return _mongo_doc_to_json(doc)
+    except (PyMongoError, InvalidId) as exc:
+        print(
+            f"[mongodb] WARNING: could not fetch product_data '{product_data_id}' "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+
+# ── Product matching / recommendation ────────────────────────────────────────
+
+def find_product_candidates(
+    product_name: Optional[str] = None,
+    brand: Optional[str] = None,
+    variant: Optional[str] = None,
+    net_quantity: Optional[str] = None,
+    barcode: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Search ``product_info`` for candidate matches using a weighted scoring system.
+
+    Scoring:
+        barcode exact match:         +50
+        brand exact match:           +30 | brand substring: +15
+        name exact match:            +40 | name substring:  +20
+        variant exact match:         +15 | variant substring: +5
+        variant clear mismatch:      -40  (both non-empty, neither contains the other)
+        net_quantity exact match:    +15
+
+    Returns
+    -------
+    All candidates scoring >= 30, sorted by score descending.
+    Each entry: {product_id, product_name, brand, variant, net_quantity, score}
+    """
+    try:
+        col = _col(PRODUCT_INFO_COLLECTION)
+        # Pull all docs — product_info stays small (one per real product)
+        docs = list(col.find({}))
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: could not query product_info "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return []
+
+    q_name = _normalize(product_name or "")
+    q_brand = _normalize(brand or "")
+    q_variant = _normalize(variant or "")
+    q_qty = _normalize(net_quantity or "")
+    q_barcode = _normalize(barcode or "")
+
+    results = []
+    for doc in docs:
+        score = 0
+
+        doc_name = _normalize(doc.get("product_name", ""))
+        doc_brand = _normalize(doc.get("brand", ""))
+        doc_variant = _normalize(doc.get("variant", ""))
+        doc_qty = _normalize(doc.get("net_quantity", ""))
+        doc_barcode = _normalize(doc.get("barcode", ""))
+
+        # Barcode — highest weight, stops comparison ambiguity
+        if q_barcode and doc_barcode and q_barcode == doc_barcode:
+            score += 50
+
+        # Brand
+        if q_brand and doc_brand:
+            if q_brand == doc_brand:
+                score += 30
+            elif q_brand in doc_brand or doc_brand in q_brand:
+                score += 15
+
+        # Product name
+        if q_name and doc_name:
+            if q_name == doc_name:
+                score += 40
+            elif q_name in doc_name or doc_name in q_name:
+                score += 20
+
+        # Variant
+        if q_variant and doc_variant:
+            if q_variant == doc_variant:
+                score += 15
+            elif q_variant in doc_variant or doc_variant in q_variant:
+                score += 5
+            else:
+                # Both present, neither contains the other → clear mismatch
+                score -= 40
+
+        # Net quantity
+        if q_qty and doc_qty and q_qty == doc_qty:
+            score += 15
+
+        if score >= 30:
+            results.append({
+                "product_id": str(doc["_id"]),
+                "product_name": doc.get("product_name", ""),
+                "brand": doc.get("brand", ""),
+                "variant": doc.get("variant", ""),
+                "net_quantity": doc.get("net_quantity", ""),
+                "score": score,
+            })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+# ── product_info create / update ─────────────────────────────────────────────
+
+def _extract_identity_fields(product_data_doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pull identity fields from a product_data document's product_identification block.
+    """
+    pi = product_data_doc.get("product_identification", {})
+
+    def _val(block: Dict[str, Any]) -> str:
+        if isinstance(block, dict):
+            return block.get("value", "Not Available")
+        return str(block) if block else "Not Available"
+
+    return {
+        "product_name": _val(pi.get("product_name", {})),
+        "brand": _val(pi.get("product_brand", {})),
+        "variant": _val(pi.get("product_variant", {})),
+        "net_quantity": _val(pi.get("net_quantity", {})),
+        "business": _val(pi.get("business", {})),
+        "division": _val(pi.get("division", {})),
+        "product_category": _val(pi.get("product_category", {})),
+        "barcode": product_data_doc.get("product_identifiers", {}).get("barcode", "Not Available"),
+    }
+
+
+def confirm_product_match(
+    product_data_id: str,
+    action: str,  # "link" | "create_new"
+    confirmed_by: str,
+    product_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Confirm a product match either by linking to an existing product_info document
+    or by creating a new one.
+
+    Parameters
+    ----------
+    product_data_id : str
+        The _id of the product_data document for this scan.
+    action : str
+        ``"link"`` or ``"create_new"``.
+    confirmed_by : str
+        Username / identifier of the person confirming.
+    product_id : str, optional
+        Required when action == ``"link"``.
+
+    Returns
+    -------
+    Updated or newly created product_info document (as dict), or None on error.
+    """
+    # Fetch the product_data document to get analyzed_at
+    pd_doc = get_product_data(product_data_id)
+    if pd_doc is None:
+        raise ValueError(f"product_data document not found: {product_data_id}")
+
+    analyzed_at = pd_doc.get("analyzed_at", _now_iso())
+
+    scan_entry: Dict[str, Any] = {
+        "product_data_id": product_data_id,
+        "analyzed_at": analyzed_at,
+        "lims_sc_value": None,
+        "lims_confirmed_by": None,
+        "product_match_confirmed_by": confirmed_by,
+    }
+
+    try:
+        col = _col(PRODUCT_INFO_COLLECTION)
+
+        if action == "link":
+            if not product_id:
+                raise ValueError("product_id is required when action is 'link'")
+            try:
+                oid = ObjectId(product_id)
+            except InvalidId:
+                raise ValueError(f"Invalid product_id: {product_id}")
+
+            result = col.find_one_and_update(
+                {"_id": oid},
+                {"$push": {"scan_history": scan_entry}},
+                return_document=True,
+            )
+            if result is None:
+                raise ValueError(f"product_info document not found: {product_id}")
+            return _mongo_doc_to_json(result)
+
+        elif action == "create_new":
+            identity = _extract_identity_fields(pd_doc)
+            now = _now_iso()
+
+            # Derive the first uploaded image filename from metadata
+            first_image = ""
+            images = pd_doc.get("metadata", {}).get("images", [])
+            if images:
+                first_image = images[0].get("filename", "")
+            else:
+                filenames = pd_doc.get("metadata", {}).get("image_filenames", [])
+                first_image = filenames[0] if filenames else ""
+
+            new_doc: Dict[str, Any] = {
+                **identity,
+                "normalized_product_name": _normalize(identity["product_name"]),
+                "normalized_brand": _normalize(identity["brand"]),
+                "first_uploaded_image": first_image,
+                "created_at": now,
+                "scan_history": [scan_entry],
+            }
+            inserted = col.insert_one(new_doc)
+            new_doc["_id"] = str(inserted.inserted_id)
+            return _mongo_doc_to_json(new_doc)
+
+        else:
+            raise ValueError(f"Invalid action: {action!r}. Must be 'link' or 'create_new'.")
+
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: confirm_product_match failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+
+# ── LIMS search / link ───────────────────────────────────────────────────────
+
+def search_lims_samples(q: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Free-text search against ``lims_sc.description``.
+
+    Each token in *q* is matched (case-insensitive regex) against the description.
+    Results are sorted by SAMPLING_DATE / created_at DESCENDING (latest first).
+    Returns up to *limit* results: [{sc, sc_value, description, sampling_date}].
+    """
+    tokens = [t for t in re.split(r"\s+", q.strip()) if t]
+    if not tokens:
+        return []
+
+    # Build AND query: every token must appear in description
+    regex_filters = [
+        {"description": {"$regex": re.escape(token), "$options": "i"}}
+        for token in tokens
+    ]
+    mongo_filter: Dict[str, Any] = {"$and": regex_filters} if len(regex_filters) > 1 else regex_filters[0]
+
+    try:
+        col = _col(LIMS_SC_COLLECTION)
+        # Sort by SAMPLING_DATE desc, fall back to created_at desc
+        cursor = (
+            col.find(
+                mongo_filter,
+                {"sc": 1, "sc_value": 1, "description": 1, "SAMPLING_DATE": 1, "created_at": 1},
+            )
+            .sort([("SAMPLING_DATE", DESCENDING), ("created_at", DESCENDING)])
+            .limit(limit)
+        )
+        results = []
+        for doc in cursor:
+            results.append({
+                "sc": doc.get("sc", ""),
+                "sc_value": doc.get("sc_value", ""),
+                "description": doc.get("description", ""),
+                "sampling_date": (
+                    doc["SAMPLING_DATE"].strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if isinstance(doc.get("SAMPLING_DATE"), datetime)
+                    else str(doc.get("SAMPLING_DATE", ""))
+                ),
+            })
+        return results
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: search_lims_samples failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return []
+
+
+def link_lims_sample(
+    product_data_id: str,
+    product_id: str,
+    lims_sc_value: str,
+    confirmed_by: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Attach a LIMS sample (lims_sc_value) to a specific scan_history entry in
+    the given product_info document.
+
+    Validates that lims_sc_value exists in lims_sc before writing.
+    Returns the updated product_info document, or None on error.
+    """
+    # 1. Validate lims_sc_value exists
+    try:
+        lims_doc = _col(LIMS_SC_COLLECTION).find_one({"sc_value": lims_sc_value})
+        if lims_doc is None:
+            raise ValueError(f"lims_sc_value not found in lims_sc: {lims_sc_value!r}")
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: lims_sc lookup failed ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+    # 2. Update the matching scan_history entry
+    try:
+        oid = ObjectId(product_id)
+    except InvalidId:
+        raise ValueError(f"Invalid product_id: {product_id}")
+
+    try:
+        result = _col(PRODUCT_INFO_COLLECTION).find_one_and_update(
+            {
+                "_id": oid,
+                "scan_history.product_data_id": product_data_id,
+            },
+            {
+                "$set": {
+                    "scan_history.$.lims_sc_value": lims_sc_value,
+                    "scan_history.$.lims_confirmed_by": confirmed_by,
+                }
+            },
+            return_document=True,
+        )
+        if result is None:
+            raise ValueError(
+                f"No matching scan_history entry found for product_id={product_id!r}, "
+                f"product_data_id={product_data_id!r}"
+            )
+        return _mongo_doc_to_json(result)
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: link_lims_sample failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+
+# ── Product list (paginated) ─────────────────────────────────────────────────
+
+def list_products(
+    page: int = 1,
+    page_size: int = 20,
+    business: Optional[str] = None,
+    division: Optional[str] = None,
+    brand: Optional[str] = None,
+    product_category: Optional[str] = None,
+    is_competitor: Optional[bool] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Return paginated product_info documents enriched with:
+    - scan_count  : number of scan_history entries
+    - latest_analyzed_at : max analyzed_at across scan_history entries
+
+    Supports filters: business, division, brand, product_category, date_from, date_to.
+    """
+    pipeline: List[Dict[str, Any]] = []
+
+    # ── Match filters ────────────────────────────────────────────────────────
+    match_stage: Dict[str, Any] = {}
+    if business:
+        match_stage["business"] = {"$regex": re.escape(business), "$options": "i"}
+    if division:
+        match_stage["division"] = {"$regex": re.escape(division), "$options": "i"}
+    if brand:
+        match_stage["brand"] = {"$regex": re.escape(brand), "$options": "i"}
+    if product_category:
+        match_stage["product_category"] = {"$regex": re.escape(product_category), "$options": "i"}
+    if is_competitor is not None:
+        match_stage["is_competitor"] = is_competitor
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+
+    # ── Add computed fields ──────────────────────────────────────────────────
+    pipeline.append({
+        "$addFields": {
+            "scan_count": {"$size": {"$ifNull": ["$scan_history", []]}},
+            "latest_analyzed_at": {
+                "$max": {
+                    "$map": {
+                        "input": {"$ifNull": ["$scan_history", []]},
+                        "as": "s",
+                        "in": "$$s.analyzed_at",
+                    }
+                }
+            },
+        }
+    })
+
+    # ── Date range filter on latest_analyzed_at ──────────────────────────────
+    if date_from or date_to:
+        date_filter: Dict[str, Any] = {}
+        if date_from:
+            date_filter["$gte"] = date_from
+        if date_to:
+            date_filter["$lte"] = date_to
+        pipeline.append({"$match": {"latest_analyzed_at": date_filter}})
+
+    # ── Project output fields ────────────────────────────────────────────────
+    pipeline.append({
+        "$project": {
+            "product_name": 1,
+            "brand": 1,
+            "variant": 1,
+            "net_quantity": 1,
+            "business": 1,
+            "division": 1,
+            "product_category": 1,
+            "is_competitor": 1,
+            "first_uploaded_image": 1,
+            "created_at": 1,
+            "scan_count": 1,
+            "latest_analyzed_at": 1,
+        }
+    })
+
+    # ── Pagination ───────────────────────────────────────────────────────────
+    skip = (page - 1) * page_size
+
+    count_pipeline = pipeline + [{"$count": "total"}]
+    data_pipeline = pipeline + [
+        {"$sort": {"latest_analyzed_at": DESCENDING}},
+        {"$skip": skip},
+        {"$limit": page_size},
+    ]
+
+    try:
+        col = _col(PRODUCT_INFO_COLLECTION)
+        count_result = list(col.aggregate(count_pipeline))
+        total = count_result[0]["total"] if count_result else 0
+        docs = list(col.aggregate(data_pipeline))
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": [_mongo_doc_to_json(d) for d in docs],
+        }
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: list_products failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+
+# ── Product detail ───────────────────────────────────────────────────────────
+
+def _compile_lims_results(sc_value: str) -> Optional[Dict[str, Any]]:
+    """
+    Join lims_sc → lims_pg → lims_pa for a given sc_value.
+    Returns a compiled test result dict, or None if not found.
+    """
+    try:
+        sc_doc = _col(LIMS_SC_COLLECTION).find_one({"sc_value": sc_value})
+        if sc_doc is None:
+            return None
+        sc = sc_doc.get("sc")
+
+        # Fetch all parameter groups for this sc
+        pgs = list(_col(LIMS_PG_COLLECTION).find({"sc": sc}))
+
+        # Fetch all parameter analyses for this sc
+        pas = list(_col(LIMS_PA_COLLECTION).find({"sc": sc}))
+
+        # Group pa entries by pg (parameter group id)
+        pa_by_pg: Dict[str, List[Dict]] = {}
+        for pa in pas:
+            pg_key = str(pa.get("sc", "")) + "_" + str(pa.get("pg", ""))
+            pa_by_pg.setdefault(pg_key, []).append(_mongo_doc_to_json(pa))
+
+        compiled_pgs = []
+        for pg in pgs:
+            pg_key = str(pg.get("sc", "")) + "_" + str(pg.get("pg", ""))
+            compiled_pgs.append({
+                **_mongo_doc_to_json(pg),
+                "analyses": pa_by_pg.get(pg_key, []),
+            })
+
+        return {
+            "sample": _mongo_doc_to_json(sc_doc),
+            "parameter_groups": compiled_pgs,
+        }
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: _compile_lims_results failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+
+def get_product_detail(product_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Return a combined product detail object:
+    - product_info document
+    - Full product_data for the most recent scan (max analyzed_at)
+    - Compiled LIMS test results for that scan (if lims_sc_value is set)
+
+    Returns None if product_info not found.
+    """
+    try:
+        oid = ObjectId(product_id)
+    except InvalidId:
+        raise ValueError(f"Invalid product_id: {product_id}")
+
+    try:
+        info_doc = _col(PRODUCT_INFO_COLLECTION).find_one({"_id": oid})
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: get_product_detail lookup failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+    if info_doc is None:
+        return None
+
+    scan_history: List[Dict] = info_doc.get("scan_history", [])
+
+    # Find the most recent scan entry (max analyzed_at)
+    most_recent = None
+    if scan_history:
+        most_recent = max(
+            scan_history,
+            key=lambda s: s.get("analyzed_at", ""),
+        )
+
+    latest_product_data = None
+    lims_results = None
+
+    if most_recent:
+        pd_id = most_recent.get("product_data_id")
+        if pd_id:
+            latest_product_data = get_product_data(pd_id)
+
+        lims_sc_val = most_recent.get("lims_sc_value")
+        if lims_sc_val:
+            lims_results = _compile_lims_results(lims_sc_val)
+
+    return {
+        "product_info": _mongo_doc_to_json(info_doc),
+        "latest_product_data": latest_product_data,
+        "lims_results": lims_results,
+    }
+
+
+# ── Product scan history ─────────────────────────────────────────────────────
+
+def get_product_history(
+    product_id: str,
+    expand: bool = False,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Return the scan_history list for a product, sorted by analyzed_at ascending.
+
+    Parameters
+    ----------
+    product_id : str
+        The product_info document _id.
+    expand : bool
+        If True, fetch and inline the full product_data + LIMS results for
+        each scan entry. No diffing is performed — raw data only.
+
+    Returns
+    -------
+    List of scan history entries, or None if product not found.
+    """
+    try:
+        oid = ObjectId(product_id)
+    except InvalidId:
+        raise ValueError(f"Invalid product_id: {product_id}")
+
+    try:
+        info_doc = _col(PRODUCT_INFO_COLLECTION).find_one(
+            {"_id": oid},
+            {"scan_history": 1},
+        )
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: get_product_history failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+    if info_doc is None:
+        return None
+
+    history: List[Dict] = sorted(
+        info_doc.get("scan_history", []),
+        key=lambda s: s.get("analyzed_at", ""),
+    )
+
+    if not expand:
+        return history
+
+    # Expand: inline full product_data + LIMS for each entry
+    expanded = []
+    for entry in history:
+        record = dict(entry)
+        pd_id = entry.get("product_data_id")
+        if pd_id:
+            record["product_data"] = get_product_data(pd_id)
+        lims_sc_val = entry.get("lims_sc_value")
+        if lims_sc_val:
+            record["lims_results"] = _compile_lims_results(lims_sc_val)
+        expanded.append(record)
+
+    return expanded

@@ -152,3 +152,4 @@ GptModel/
 
 - Python 3.11+
 - OpenAI API key with GPT-4o or GPT-4o-mini access
+# C_intelligence
