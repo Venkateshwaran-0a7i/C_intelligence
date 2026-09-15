@@ -39,6 +39,7 @@ PRODUCT_DATA_COLLECTION = os.environ.get("PRODUCT_DATA_COLLECTION", "product_dat
 PRODUCT_INFO_COLLECTION = os.environ.get("PRODUCT_INFO_COLLECTION", "product_info")
 
 # LIMS collections (read-only; already exist in the database)
+LIMS_MONGO_DB     = os.environ.get("LIMS_MONGO_DB", "lims")  # separate DB from Competition_intelligence
 LIMS_SC_COLLECTION = os.environ.get("LIMS_SC_COLLECTION", "lims_sc")
 LIMS_PG_COLLECTION = os.environ.get("LIMS_PG_COLLECTION", "lims_pg")
 LIMS_PA_COLLECTION = os.environ.get("LIMS_PA_COLLECTION", "lims_pa")
@@ -75,8 +76,13 @@ def _get_bucket() -> GridFSBucket:
 
 
 def _col(name: str):
-    """Return a collection handle."""
+    """Return a collection handle in the main Competition_intelligence database."""
     return _get_client()[MONGO_DB][name]
+
+
+def _lims_col(name: str):
+    """Return a collection handle in the separate LIMS database."""
+    return _get_client()[LIMS_MONGO_DB][name]
 
 
 def _now_iso() -> str:
@@ -84,9 +90,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_PLACEHOLDER_VALUES = {"", "not available", "n/a", "na", "none", "null"}
+
+
 def _normalize(text: str) -> str:
-    """Lowercase + strip for fuzzy matching."""
-    return (text or "").lower().strip()
+    """Lowercase + strip for fuzzy matching. Returns '' for placeholder
+    values so they never contribute to a match score."""
+    cleaned = (text or "").lower().strip()
+    return "" if cleaned in _PLACEHOLDER_VALUES else cleaned
 
 
 def _mongo_doc_to_json(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -350,6 +361,75 @@ def find_product_candidates(
     return results
 
 
+# ── Auto product linking ──────────────────────────────────────────────────────
+
+AUTO_LINK_SCORE_THRESHOLD = 70
+
+
+def auto_link_or_create_product(product_data_id: str) -> Dict[str, Any]:
+    """
+    Automatically link a product_data scan to an existing product_info document,
+    or create a new one if no confident match exists.
+
+    Uses find_product_candidates() for scoring (unchanged scoring logic,
+    including "Not Available" placeholder filtering and variant clear-mismatch
+    penalty already in place). If the top candidate scores >=
+    AUTO_LINK_SCORE_THRESHOLD, links to it; otherwise creates a new
+    product_info document.
+
+    The resulting scan_history entry's product_match_confirmed_by is set to
+    ``"system-auto"`` to distinguish automated links from human-confirmed ones
+    in the audit trail. The match score is also recorded for transparency.
+
+    Returns
+    -------
+    {
+        "product_info": <the linked or created product_info document>,
+        "action": "link" | "create_new",
+        "match_score": <int or None>,
+    }
+    """
+    pd_doc = get_product_data(product_data_id)
+    if pd_doc is None:
+        raise ValueError(f"product_data document not found: {product_data_id}")
+
+    identity = _extract_identity_fields(pd_doc)
+
+    candidates = find_product_candidates(
+        product_name=identity["product_name"],
+        brand=identity["brand"],
+        variant=identity["variant"],
+        net_quantity=identity["net_quantity"],
+        barcode=identity.get("barcode"),
+    )
+
+    top = candidates[0] if candidates else None
+
+    if top and top["score"] >= AUTO_LINK_SCORE_THRESHOLD:
+        result = confirm_product_match(
+            product_data_id=product_data_id,
+            action="link",
+            confirmed_by="system-auto",
+            product_id=top["product_id"],
+        )
+        return {
+            "product_info": result,
+            "action": "link",
+            "match_score": top["score"],
+        }
+    else:
+        result = confirm_product_match(
+            product_data_id=product_data_id,
+            action="create_new",
+            confirmed_by="system-auto",
+        )
+        return {
+            "product_info": result,
+            "action": "create_new",
+            "match_score": top["score"] if top else None,
+        }
+
+
 # ── product_info create / update ─────────────────────────────────────────────
 
 def _extract_identity_fields(product_data_doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -472,54 +552,117 @@ def confirm_product_match(
         return None
 
 
-# ── LIMS search / link ───────────────────────────────────────────────────────
+# ── LIMS list / link ──────────────────────────────────────────────────────────
 
-def search_lims_samples(q: str, limit: int = 50) -> List[Dict[str, Any]]:
+# Field paths in the lims_sc collection (all values live inside additional_data)
+_AD = "additional_data"
+
+
+def list_lims_samples(limit: int = 1000) -> List[Dict[str, Any]]:
     """
-    Free-text search against ``lims_sc.description``.
+    Return LIMS samples (lims_sc), most recent first, with no server-side
+    filtering or relevance ranking. The frontend handles all text filtering
+    client-side over this full list.
 
-    Each token in *q* is matched (case-insensitive regex) against the description.
-    Results are sorted by SAMPLING_DATE / created_at DESCENDING (latest first).
     Returns up to *limit* results: [{sc, sc_value, description, sampling_date}].
+
+    Real document shape:
+        { additional_data: { SC_VALUE, DESCRIPTION, SAMPLING_DATE (ISO str), … } }
     """
-    tokens = [t for t in re.split(r"\s+", q.strip()) if t]
-    if not tokens:
-        return []
-
-    # Build AND query: every token must appear in description
-    regex_filters = [
-        {"description": {"$regex": re.escape(token), "$options": "i"}}
-        for token in tokens
-    ]
-    mongo_filter: Dict[str, Any] = {"$and": regex_filters} if len(regex_filters) > 1 else regex_filters[0]
-
     try:
-        col = _col(LIMS_SC_COLLECTION)
-        # Sort by SAMPLING_DATE desc, fall back to created_at desc
+        col = _lims_col(LIMS_SC_COLLECTION)
         cursor = (
             col.find(
-                mongo_filter,
-                {"sc": 1, "sc_value": 1, "description": 1, "SAMPLING_DATE": 1, "created_at": 1},
+                {},
+                {f"{_AD}.SC_VALUE": 1, f"{_AD}.DESCRIPTION": 1, f"{_AD}.SAMPLING_DATE": 1},
             )
-            .sort([("SAMPLING_DATE", DESCENDING), ("created_at", DESCENDING)])
+            .sort([(f"{_AD}.SAMPLING_DATE", DESCENDING)])
             .limit(limit)
         )
         results = []
         for doc in cursor:
+            ad = doc.get(_AD) or {}
+            sc_value = str(ad.get("SC_VALUE") or "")
+            sampling_date = str(ad.get("SAMPLING_DATE") or "")
+            # Normalise ISO string — strip sub-second precision and TZ offset for display
+            if "T" in sampling_date:
+                sampling_date = sampling_date[:19]  # keep YYYY-MM-DDTHH:MM:SS
             results.append({
-                "sc": doc.get("sc", ""),
-                "sc_value": doc.get("sc_value", ""),
-                "description": doc.get("description", ""),
-                "sampling_date": (
-                    doc["SAMPLING_DATE"].strftime("%Y-%m-%dT%H:%M:%SZ")
-                    if isinstance(doc.get("SAMPLING_DATE"), datetime)
-                    else str(doc.get("SAMPLING_DATE", ""))
-                ),
+                "sc": sc_value,
+                "sc_value": sc_value,
+                "description": str(ad.get("DESCRIPTION") or ""),
+                "sampling_date": sampling_date,
             })
         return results
     except PyMongoError as exc:
         print(
-            f"[mongodb] WARNING: search_lims_samples failed "
+            f"[mongodb] WARNING: list_lims_samples failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return []
+
+
+def list_lims_admin(limit: int = 2000) -> List[Dict[str, Any]]:
+    """
+    Return every lims_sc document, most recent first, enriched with
+    ``linked_product_count`` — the number of distinct product_info documents
+    whose scan_history contains this sc_value.
+
+    Used by the LIMS admin page.
+    Returns [{sc_value, description, sampling_date, linked_product_count}].
+    """
+    try:
+        # 1. Fetch all lims_sc rows
+        sc_col = _lims_col(LIMS_SC_COLLECTION)
+        cursor = (
+            sc_col.find(
+                {},
+                {f"{_AD}.SC_VALUE": 1, f"{_AD}.DESCRIPTION": 1, f"{_AD}.SAMPLING_DATE": 1},
+            )
+            .sort([(f"{_AD}.SAMPLING_DATE", DESCENDING)])
+            .limit(limit)
+        )
+        rows = []
+        sc_values = []
+        for doc in cursor:
+            ad = doc.get(_AD) or {}
+            sv = str(ad.get("SC_VALUE") or "")
+            sampling_date = str(ad.get("SAMPLING_DATE") or "")
+            if "T" in sampling_date:
+                sampling_date = sampling_date[:19]
+            sc_values.append(sv)
+            rows.append({
+                "sc_value": sv,
+                "description": str(ad.get("DESCRIPTION") or ""),
+                "sampling_date": sampling_date,
+                "linked_product_count": 0,
+            })
+
+        if not rows:
+            return []
+
+        # 2. Count linked products per sc_value via a single aggregation
+        pi_col = _col(PRODUCT_INFO_COLLECTION)
+        agg = pi_col.aggregate([
+            {"$unwind": "$scan_history"},
+            {"$match": {"scan_history.lims_sc_value": {"$in": sc_values, "$ne": None}}},
+            {"$group": {
+                "_id": "$scan_history.lims_sc_value",
+                "count": {"$addToSet": "$_id"},
+            }},
+            {"$project": {"_id": 1, "count": {"$size": "$count"}}},
+        ])
+        count_map: Dict[str, int] = {r["_id"]: r["count"] for r in agg}
+
+        # 3. Merge counts back
+        for row in rows:
+            row["linked_product_count"] = count_map.get(row["sc_value"], 0)
+
+        return rows
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: list_lims_admin failed "
             f"({type(exc).__name__}: {exc})",
             file=sys.stderr,
         )
@@ -539,9 +682,11 @@ def link_lims_sample(
     Validates that lims_sc_value exists in lims_sc before writing.
     Returns the updated product_info document, or None on error.
     """
-    # 1. Validate lims_sc_value exists
+    # 1. Validate lims_sc_value exists in the lims DB
     try:
-        lims_doc = _col(LIMS_SC_COLLECTION).find_one({"sc_value": lims_sc_value})
+        lims_doc = _lims_col(LIMS_SC_COLLECTION).find_one(
+            {f"{_AD}.SC_VALUE": lims_sc_value}
+        )
         if lims_doc is None:
             raise ValueError(f"lims_sc_value not found in lims_sc: {lims_sc_value!r}")
     except PyMongoError as exc:
@@ -704,16 +849,19 @@ def _compile_lims_results(sc_value: str) -> Optional[Dict[str, Any]]:
     Returns a compiled test result dict, or None if not found.
     """
     try:
-        sc_doc = _col(LIMS_SC_COLLECTION).find_one({"sc_value": sc_value})
+        sc_doc = _lims_col(LIMS_SC_COLLECTION).find_one(
+            {f"{_AD}.SC_VALUE": sc_value}
+        )
         if sc_doc is None:
             return None
-        sc = sc_doc.get("sc")
+        # The SC integer key used to join lims_pg / lims_pa is stored in additional_data.SC
+        sc = (sc_doc.get(_AD) or {}).get("SC")
 
         # Fetch all parameter groups for this sc
-        pgs = list(_col(LIMS_PG_COLLECTION).find({"sc": sc}))
+        pgs = list(_lims_col(LIMS_PG_COLLECTION).find({"sc": sc}))
 
         # Fetch all parameter analyses for this sc
-        pas = list(_col(LIMS_PA_COLLECTION).find({"sc": sc}))
+        pas = list(_lims_col(LIMS_PA_COLLECTION).find({"sc": sc}))
 
         # Group pa entries by pg (parameter group id)
         pa_by_pg: Dict[str, List[Dict]] = {}
@@ -729,8 +877,22 @@ def _compile_lims_results(sc_value: str) -> Optional[Dict[str, Any]]:
                 "analyses": pa_by_pg.get(pg_key, []),
             })
 
+        ad = sc_doc.get(_AD) or {}
+        sc_value_str = str(ad.get("SC_VALUE") or "")
+        description_str = str(ad.get("DESCRIPTION") or "")
+        sampling_date_str = str(ad.get("SAMPLING_DATE") or "")
+        if "T" in sampling_date_str:
+            sampling_date_str = sampling_date_str[:19]
+
+        sample_json = _mongo_doc_to_json(sc_doc)
+        # Inject flat fields so the frontend can read them without digging into additional_data
+        sample_json["sc_value"] = sc_value_str
+        sample_json["description"] = description_str
+        sample_json["sampling_date"] = sampling_date_str
+        sample_json["SAMPLING_DATE"] = sampling_date_str  # kept for backward-compat with LimsPanel
+
         return {
-            "sample": _mongo_doc_to_json(sc_doc),
+            "sample": sample_json,
             "parameter_groups": compiled_pgs,
         }
     except PyMongoError as exc:

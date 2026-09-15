@@ -62,7 +62,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -191,11 +191,12 @@ async def extract(
     temperature: float = Form(1),
 ):
     """
-    Upload product images → run extraction pipeline → store in product_data.
+    Upload product images → run extraction pipeline → store in product_data
+    → automatically match to an existing product or create a new one.
 
-    Returns ``{product_data_id, analyzed_at, extracted_json}``.
-    The product_data document is immutable after creation.
-    No product matching or LIMS linking happens here.
+    Returns ``{product_data_id, analyzed_at, extracted_json, product_id,
+    product_action, match_score}``. LIMS linking is NOT done here — that
+    remains a manual step via GET /lims/search + POST /product-data/{id}/lims.
     """
     from src.extractor import extract_product_data
 
@@ -223,7 +224,7 @@ async def extract(
         )
 
         # ── Persist images to GridFS ─────────────────────────────────────────
-        from src.db import save_image, save_product_data
+        from src.db import save_image, save_product_data, auto_link_or_create_product
 
         image_refs, image_ids = [], []
         for filename, content_type, content in image_payloads:
@@ -251,6 +252,17 @@ async def extract(
             product_data_id, analyzed_at = saved
             response["product_data_id"] = product_data_id
             response["analyzed_at"] = analyzed_at
+
+            # Automatically match to an existing product or create a new one.
+            # LIMS linking remains a separate, manual step.
+            try:
+                link_result = auto_link_or_create_product(product_data_id)
+                response["product_id"] = link_result["product_info"]["_id"]
+                response["product_action"] = link_result["action"]
+                response["match_score"] = link_result["match_score"]
+            except ValueError as exc:
+                response["product_link_error"] = str(exc)
+
         if image_ids:
             response["image_ids"] = image_ids
 
@@ -365,25 +377,34 @@ async def confirm_product(body: ConfirmProductBody):
     return result
 
 
-# ── 4. GET /lims/search ───────────────────────────────────────────────────────
+# ── 4. GET /lims/list ─────────────────────────────────────────────────────────
 
-@app.get("/lims/search", tags=["LIMS"])
-async def lims_search(q: str = Query(..., description="Free-text search query")):
+@app.get("/lims/list", tags=["LIMS"])
+async def lims_list(limit: int = Query(1000, ge=1, le=5000)):
     """
-    Search LIMS samples (lims_sc) by free text against the description field.
-
-    Each token in the query is matched (case-insensitive regex) against description.
-    Results are sorted by SAMPLING_DATE descending (latest first).
-    Returns up to 50 results: {sc, sc_value, description, sampling_date}.
-
-    **Recommendation only** — does not auto-link anything.
+    Return all LIMS samples, most recent first. No matching or relevance
+    ranking — the frontend filters this list client-side.
     """
-    from src.db import search_lims_samples
+    from src.db import list_lims_samples
 
-    if not q.strip():
-        raise HTTPException(status_code=422, detail="Query 'q' must not be empty")
+    results = list_lims_samples(limit=limit)
+    return {"results": results, "count": len(results)}
 
-    results = search_lims_samples(q)
+
+# ── 4b. GET /lims/admin ────────────────────────────────────────────────────────
+
+@app.get("/lims/admin", tags=["LIMS"])
+async def lims_admin(limit: int = Query(2000, ge=1, le=10000)):
+    """
+    Return every LIMS sample card (lims_sc), most recent first, with
+    ``linked_product_count`` — the number of distinct product_info documents
+    whose scan_history references each sc_value.
+
+    Used by the LIMS admin page in the frontend.
+    """
+    from src.db import list_lims_admin
+
+    results = list_lims_admin(limit=limit)
     return {"results": results, "count": len(results)}
 
 

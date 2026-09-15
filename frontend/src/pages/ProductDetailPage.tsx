@@ -157,6 +157,17 @@ export default function ProductDetailPage() {
             <span className="text-xs text-slate-400">
               {scanCount} scan{scanCount === 1 ? '' : 's'} recorded
             </span>
+            {/* Always-visible LIMS link shortcut in the header */}
+            {productDataId && (
+              <button
+                type="button"
+                onClick={() => setLimsModalOpen(true)}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:border-teal-400 hover:text-teal-700"
+              >
+                <LinkIcon className="h-3 w-3" />
+                {latestScan?.lims_sc_value ? 'Replace LIMS sample' : 'Link LIMS sample'}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -312,28 +323,44 @@ export default function ProductDetailPage() {
       )}
 
       {tab === 'lims' && (
-        <div className="rounded-xl border border-slate-200 bg-white p-5">
-          {latestScan?.lims_sc_value && limsResults ? (
-            <LimsPanel limsResults={limsResults} />
-          ) : (
-            <EmptyState
-              icon={<FlaskConical className="h-10 w-10" />}
-              title="No LIMS sample linked"
-              message="Link a LIMS sample to this latest scan to view its lab results."
-              action={
-                productDataId ? (
-                  <button
-                    type="button"
-                    onClick={() => setLimsModalOpen(true)}
-                    className="inline-flex items-center gap-1 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700"
-                  >
-                    <LinkIcon className="h-4 w-4" />
-                    Link a LIMS sample
-                  </button>
-                ) : undefined
-              }
-            />
+        <div className="space-y-3">
+          {/* Always-visible Link / Replace button at the top of the LIMS tab */}
+          {productDataId && (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setLimsModalOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700"
+              >
+                <LinkIcon className="h-4 w-4" />
+                {latestScan?.lims_sc_value ? 'Replace LIMS sample' : 'Link LIMS sample'}
+              </button>
+            </div>
           )}
+
+          <div className="rounded-xl border border-slate-200 bg-white p-5">
+            {latestScan?.lims_sc_value && limsResults ? (
+              <LimsPanel limsResults={limsResults} />
+            ) : (
+              <EmptyState
+                icon={<FlaskConical className="h-10 w-10" />}
+                title="No LIMS sample linked"
+                message="Link a LIMS sample to this latest scan to view its lab results."
+                action={
+                  productDataId ? (
+                    <button
+                      type="button"
+                      onClick={() => setLimsModalOpen(true)}
+                      className="inline-flex items-center gap-1 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700"
+                    >
+                      <LinkIcon className="h-4 w-4" />
+                      Link a LIMS sample
+                    </button>
+                  ) : undefined
+                }
+              />
+            )}
+          </div>
         </div>
       )}
 

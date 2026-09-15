@@ -57,12 +57,25 @@ export function FieldValue({
 
 interface ChipListProps {
   label: string
-  items?: string[] | null
+  items?: (string | { value?: string; confidence?: string } | null)[] | null
   className?: string
 }
 
+/** Safely coerce a chip item — string or {value} object — to display text. */
+function chipText(item: string | { value?: string } | null | undefined): string {
+  if (item == null) return ''
+  if (typeof item === 'string') return item.trim()
+  if (typeof item === 'object' && 'value' in item) {
+    return (item.value ?? '').toString().trim()
+  }
+  return String(item).trim()
+}
+
 export function ChipList({ label, items, className }: ChipListProps) {
-  const list = items?.filter((i) => i && i.trim() !== '') ?? []
+  const list = (items ?? [])
+    .map(chipText)
+    .filter((text) => text !== '' && text !== 'Not Available')
+
   return (
     <div className={className}>
       <dt className="text-xs font-medium uppercase tracking-wide text-slate-500">

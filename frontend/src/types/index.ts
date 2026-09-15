@@ -198,6 +198,14 @@ export interface LimsSearchResult {
   sampling_date: string
 }
 
+/** Row returned by GET /lims/admin — enriched with linked product count. */
+export interface LimsAdminRow {
+  sc_value: string
+  description: string
+  sampling_date: string
+  linked_product_count: number
+}
+
 export interface LimsPAAnalysis {
   _id?: string
   sc?: string
@@ -240,6 +248,14 @@ export interface ExtractResponse {
   product_data_id?: string
   analyzed_at?: string
   image_ids?: string[]
+  /** _id of the auto-linked or newly created product_info document */
+  product_id?: string
+  /** Whether the scan was auto-linked to an existing product or a new one was created */
+  product_action?: 'link' | 'create_new'
+  /** Scoring basis for the auto-link decision (null when no candidates existed) */
+  match_score?: number | null
+  /** Set only when auto-linking failed despite a successful extraction */
+  product_link_error?: string
 }
 
 // ── POST /products/confirm ──────────────────────────────────────────────────

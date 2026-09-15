@@ -1,11 +1,12 @@
 // Typed API client for the GptModel FastAPI backend.
-// Base URL from VITE_API_BASE_URL, defaulting to http://localhost:8000.
+// Base URL from VITE_API_URL or VITE_API_BASE_URL, defaulting to http://localhost:8000.
 
 import type {
   AttachLimsBody,
   ConfirmProductBody,
   ExtractResponse,
   HealthResponse,
+  LimsAdminRow,
   LimsSearchResult,
   MatchResponse,
   PaginatedProducts,
@@ -16,7 +17,9 @@ import type {
 } from '../types'
 
 const BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+  import.meta.env.VITE_API_URL ||
+  import.meta.env.VITE_API_BASE_URL ||
+  'http://localhost:8000'
 
 export class ApiError extends Error {
   status: number
@@ -112,9 +115,14 @@ export const api = {
   extract: (formData: FormData) =>
     request<ExtractResponse>('/extract', { method: 'POST', body: formData }),
 
-  searchLims: (q: string) =>
+  listLims: (limit = 1000) =>
     request<{ results: LimsSearchResult[]; count: number }>(
-      `/lims/search?q=${encodeURIComponent(q)}`,
+      `/lims/list?limit=${limit}`,
+    ),
+
+  getLimsAdmin: (limit = 2000) =>
+    request<{ results: LimsAdminRow[]; count: number }>(
+      `/lims/admin?limit=${limit}`,
     ),
 
   attachLims: (productDataId: string, body: AttachLimsBody) =>

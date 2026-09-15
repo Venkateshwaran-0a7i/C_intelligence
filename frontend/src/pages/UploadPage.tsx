@@ -2,19 +2,26 @@ import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Box,
+  CheckCircle,
+  FlaskConical,
   ImagePlus,
   Loader2,
-  PackageCheck,
-  PackageSearch,
-  Plus,
+  PlusCircle,
   Upload,
   X,
 } from 'lucide-react'
 import api, { ApiError } from '../lib/api'
-import type { ExtractResponse, MatchCandidate } from '../types'
-import EmptyState from '../components/EmptyState'
+import type { ExtractResponse } from '../types'
+import LimsSearchModal from '../components/LimsSearchModal'
 
-type Stage = 'idle' | 'extracting' | 'matching' | 'confirming'
+type Stage = 'idle' | 'extracting' | 'lims'
+
+/** Strip placeholder / empty values before building the LIMS default query. */
+function cleanValue(value?: string): string | undefined {
+  const v = (value || '').trim()
+  if (!v || v.toLowerCase() === 'not available') return undefined
+  return v
+}
 
 export default function UploadPage() {
   const inputRef = useRef<HTMLInputElement>(null)
@@ -24,13 +31,10 @@ export default function UploadPage() {
   const [stage, setStage] = useState<Stage>('idle')
   const [error, setError] = useState<string | null>(null)
   const [extractResult, setExtractResult] = useState<ExtractResponse | null>(null)
-  const [candidates, setCandidates] = useState<MatchCandidate[]>([])
-  const [confirming, setConfirming] = useState<string | null>(null)
 
   const addFiles = (list: FileList | null) => {
     if (!list) return
-    const incoming = Array.from(list)
-    setFiles((prev) => [...prev, ...incoming])
+    setFiles((prev) => [...prev, ...Array.from(list)])
   }
 
   const removeFile = (index: number) => {
@@ -47,39 +51,19 @@ export default function UploadPage() {
       const result = await api.extract(formData)
       setExtractResult(result)
 
-      const id = result.extracted_json?.product_identification
-      const match = await api.matchProducts({
-        product_name: id?.product_name?.value,
-        brand: id?.product_brand?.value,
-        variant: id?.product_variant?.value,
-        net_quantity: id?.net_quantity?.value,
-      })
-      setCandidates(match.candidates)
-      setStage('matching')
+      if (!result.product_id) {
+        setError(
+          result.product_link_error ||
+            'Extraction succeeded but the product could not be linked or created.',
+        )
+        setStage('idle')
+        return
+      }
+
+      setStage('lims')
     } catch (e) {
       setStage('idle')
       setError(e instanceof ApiError ? e.message : 'Extraction failed')
-    }
-  }
-
-  const handleConfirm = async (candidate?: MatchCandidate, createNew = false) => {
-    if (!extractResult?.product_data_id) {
-      setError('No product_data_id returned from extraction.')
-      return
-    }
-    setConfirming(createNew ? 'new' : candidate?.product_id ?? '')
-    setError(null)
-    try {
-      const confirmed = await api.confirmProduct({
-        product_data_id: extractResult.product_data_id,
-        action: createNew ? 'create_new' : 'link',
-        ...(candidate && !createNew ? { product_id: candidate.product_id } : {}),
-        confirmed_by: 'user',
-      })
-      navigate(`/products/${confirmed._id}`)
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : 'Failed to confirm product')
-      setConfirming(null)
     }
   }
 
@@ -87,7 +71,6 @@ export default function UploadPage() {
     setFiles([])
     setError(null)
     setExtractResult(null)
-    setCandidates([])
     setStage('idle')
   }
 
@@ -95,6 +78,7 @@ export default function UploadPage() {
     <div className="mx-auto max-w-3xl space-y-4 px-4 py-6">
       <h1 className="text-xl font-semibold text-slate-900">Upload product images</h1>
 
+      {/* ── Idle: file picker ───────────────────────────────────────────────── */}
       {stage === 'idle' && (
         <>
           <div
@@ -135,9 +119,7 @@ export default function UploadPage() {
                 >
                   <div className="flex items-center gap-2 overflow-hidden">
                     <Box className="h-4 w-4 shrink-0 text-slate-400" />
-                    <span className="truncate text-sm text-slate-700">
-                      {f.name}
-                    </span>
+                    <span className="truncate text-sm text-slate-700">{f.name}</span>
                     <span className="text-xs text-slate-400">
                       ({(f.size / 1024).toFixed(0)} KB)
                     </span>
@@ -165,6 +147,7 @@ export default function UploadPage() {
         </>
       )}
 
+      {/* ── Extracting: spinner ─────────────────────────────────────────────── */}
       {stage === 'extracting' && (
         <div className="flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-white px-6 py-12 text-center">
           <Loader2 className="mb-3 h-8 w-8 animate-spin text-teal-600" />
@@ -175,104 +158,65 @@ export default function UploadPage() {
         </div>
       )}
 
-      {stage === 'matching' && extractResult && (
+      {/* ── LIMS step ───────────────────────────────────────────────────────── */}
+      {stage === 'lims' && extractResult?.product_id && (
         <div className="space-y-4">
-          <div className="rounded-xl border border-slate-200 bg-white p-5">
-            <h2 className="flex items-center gap-2 text-base font-semibold text-slate-900">
-              <PackageCheck className="h-5 w-5 text-teal-600" />
-              Extracted product
-            </h2>
-            <div className="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
-              <span className="text-slate-500">
-                Name:{' '}
-                <span className="text-slate-900">
-                  {extractResult.extracted_json?.product_identification?.product_name?.value}
-                </span>
-              </span>
-              <span className="text-slate-500">
-                Brand:{' '}
-                <span className="text-slate-900">
-                  {extractResult.extracted_json?.product_identification?.product_brand?.value}
-                </span>
-              </span>
-              <span className="text-slate-500">
-                Variant:{' '}
-                <span className="text-slate-900">
-                  {extractResult.extracted_json?.product_identification?.product_variant?.value}
-                </span>
-              </span>
-              <span className="text-slate-500">
-                Net quantity:{' '}
-                <span className="text-slate-900">
-                  {extractResult.extracted_json?.product_identification?.net_quantity?.value}
-                </span>
-              </span>
-            </div>
+          {/* Auto-match result banner */}
+          <div
+            className={`flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium ${
+              extractResult.product_action === 'link'
+                ? 'border-teal-200 bg-teal-50 text-teal-800'
+                : 'border-blue-200 bg-blue-50 text-blue-800'
+            }`}
+          >
+            {extractResult.product_action === 'link' ? (
+              <>
+                <CheckCircle className="h-4 w-4 shrink-0" />
+                Matched to an existing product (score {extractResult.match_score}).
+              </>
+            ) : (
+              <>
+                <PlusCircle className="h-4 w-4 shrink-0" />
+                No close match found — added as a new product.
+              </>
+            )}
           </div>
 
-          <h3 className="font-semibold text-slate-800">
-            Does this match an existing product?
-          </h3>
+          {/* Step indicator */}
+          <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5">
+            <FlaskConical className="h-4 w-4 shrink-0 text-teal-600" />
+            <p className="text-sm font-medium text-slate-700">
+              Link a lab sample <span className="font-normal text-slate-400">(optional)</span>
+            </p>
+          </div>
 
-          {candidates.length === 0 ? (
-            <EmptyState
-              icon={<PackageSearch className="h-10 w-10" />}
-              title="No existing matches found"
-              message="No existing products matched this extraction. You can create a new product from it."
-            />
-          ) : (
-            <ul className="space-y-2">
-              {candidates.map((c) => (
-                <li
-                  key={c.product_id}
-                  className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-slate-800">
-                      {c.product_name || 'Unnamed product'}
-                    </p>
-                    <p className="truncate text-xs text-slate-500">
-                      {[c.brand, c.variant, c.net_quantity]
-                        .filter((s) => s && s !== 'Not Available')
-                        .join(' · ') || '—'}
-                    </p>
-                    <p className="mt-0.5 text-xs text-teal-700">
-                      Match score {c.score}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={confirming === c.product_id}
-                    onClick={() => void handleConfirm(c)}
-                    className="shrink-0 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
-                  >
-                    {confirming === c.product_id ? 'Confirming…' : 'Same product'}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+          {/* Reuse existing LimsSearchModal */}
+          <LimsSearchModal
+            productId={extractResult.product_id}
+            productDataId={extractResult.product_data_id ?? ''}
+            defaultQuery={[
+              extractResult.extracted_json?.product_identification?.product_brand?.value,
+              extractResult.extracted_json?.product_identification?.product_name?.value,
+              extractResult.extracted_json?.product_identification?.product_variant?.value,
+            ]
+              .map((v) => cleanValue(v))
+              .filter(Boolean)
+              .join(' ')}
+            onClose={() => navigate(`/products/${extractResult.product_id}`)}
+            onAttached={() => navigate(`/products/${extractResult.product_id}`)}
+          />
 
           <button
             type="button"
-            disabled={confirming === 'new'}
-            onClick={() => void handleConfirm(undefined, true)}
-            className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-          >
-            <Plus className="h-4 w-4" />
-            {confirming === 'new' ? 'Creating…' : 'None of these — new product'}
-          </button>
-
-          <button
-            type="button"
-            onClick={reset}
+            onClick={() => navigate(`/products/${extractResult.product_id}`)}
             className="block text-sm text-slate-500 hover:text-slate-800"
           >
-            Start over
+            Skip for now — link a LIMS sample later
           </button>
         </div>
       )}
 
+      {/* ── Error banner ────────────────────────────────────────────────────── */}
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
@@ -288,7 +232,8 @@ export default function UploadPage() {
         </div>
       )}
 
-      {(stage === 'extracting' || stage === 'matching') && !error && (
+      {/* ── Cancel during extraction ─────────────────────────────────────────── */}
+      {stage === 'extracting' && !error && (
         <button
           type="button"
           onClick={reset}

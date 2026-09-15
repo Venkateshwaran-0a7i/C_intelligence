@@ -16,16 +16,30 @@ function LimsStatusBadge({ entry }: { entry: ExpandedHistoryEntry }) {
   )
 }
 
+/** Safely coerce a claim / ingredient item to a plain display string. */
+function toText(item: unknown): string {
+  if (item == null) return ''
+  if (typeof item === 'string') return item.trim()
+  if (typeof item === 'object' && 'value' in (item as object)) {
+    return String((item as { value?: unknown }).value ?? '').trim()
+  }
+  return String(item).trim()
+}
+
 function summary(entry: ExpandedHistoryEntry) {
   const data = entry.product_data
   if (!data) return null
   const claims = [
     ...(data.packaging_claims?.front_package_claims ?? []),
     ...(data.packaging_claims?.back_package_claims ?? []),
-  ].filter((c) => c && c.trim() !== '')
-  const ingredients = (data.ingredients_information?.ingredients ?? []).filter(
-    (i) => i && i.trim() !== '',
-  )
+  ]
+    .map(toText)
+    .filter((c) => c !== '' && c !== 'Not Available')
+
+  const ingredients = (data.ingredients_information?.ingredients ?? [])
+    .map(toText)
+    .filter((i) => i !== '' && i !== 'Not Available')
+
   return { claims, ingredients }
 }
 
