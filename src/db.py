@@ -123,6 +123,19 @@ def _mongo_doc_to_json(doc: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _id_filter(id_val: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a MongoDB query matching `_id` as either string or ObjectId."""
+    conds: List[Dict[str, Any]] = [{"_id": id_val}]
+    try:
+        conds.append({"_id": ObjectId(id_val)})
+    except Exception:
+        pass
+
+    if extra:
+        return {"$and": [{"$or": conds}, extra]}
+    return {"$or": conds}
+
+
 # ── GridFS image storage ─────────────────────────────────────────────────────
 
 def save_image(
@@ -246,14 +259,13 @@ def save_product_data(
 
 
 def get_product_data(product_data_id: str) -> Optional[Dict[str, Any]]:
-    """Fetch a single product_data document by its _id string."""
+    """Fetch a single product_data document by its _id string or ObjectId."""
     try:
-        oid = ObjectId(product_data_id)
-        doc = _col(PRODUCT_DATA_COLLECTION).find_one({"_id": oid})
+        doc = _col(PRODUCT_DATA_COLLECTION).find_one(_id_filter(product_data_id))
         if doc is None:
             return None
         return _mongo_doc_to_json(doc)
-    except (PyMongoError, InvalidId) as exc:
+    except PyMongoError as exc:
         print(
             f"[mongodb] WARNING: could not fetch product_data '{product_data_id}' "
             f"({type(exc).__name__}: {exc})",
@@ -501,13 +513,9 @@ def confirm_product_match(
         if action == "link":
             if not product_id:
                 raise ValueError("product_id is required when action is 'link'")
-            try:
-                oid = ObjectId(product_id)
-            except InvalidId:
-                raise ValueError(f"Invalid product_id: {product_id}")
 
             result = col.find_one_and_update(
-                {"_id": oid},
+                _id_filter(product_id),
                 {"$push": {"scan_history": scan_entry}},
                 return_document=True,
             )
@@ -698,16 +706,8 @@ def link_lims_sample(
 
     # 2. Update the matching scan_history entry
     try:
-        oid = ObjectId(product_id)
-    except InvalidId:
-        raise ValueError(f"Invalid product_id: {product_id}")
-
-    try:
         result = _col(PRODUCT_INFO_COLLECTION).find_one_and_update(
-            {
-                "_id": oid,
-                "scan_history.product_data_id": product_data_id,
-            },
+            _id_filter(product_id, {"scan_history.product_data_id": product_data_id}),
             {
                 "$set": {
                     "scan_history.$.lims_sc_value": lims_sc_value,
@@ -845,8 +845,12 @@ def list_products(
 
 def _compile_lims_results(sc_value: str) -> Optional[Dict[str, Any]]:
     """
-    Join lims_sc → lims_pg → lims_pa for a given sc_value.
-    Returns a compiled test result dict, or None if not found.
+    Join lims_sc -> lims_pg -> lims_pa for a given sc_value.
+
+    Driven by lims_pa (the actual test results), not lims_pg, so a
+    result is never hidden just because its parameter-group metadata
+    record is missing. lims_pg is used only to look up a display name
+    for the group when a matching record exists.
     """
     try:
         sc_doc = _lims_col(LIMS_SC_COLLECTION).find_one(
@@ -857,25 +861,51 @@ def _compile_lims_results(sc_value: str) -> Optional[Dict[str, Any]]:
         # The SC integer key used to join lims_pg / lims_pa is stored in additional_data.SC
         sc = (sc_doc.get(_AD) or {}).get("SC")
 
-        # Fetch all parameter groups for this sc
-        pgs = list(_lims_col(LIMS_PG_COLLECTION).find({"sc": sc}))
-
-        # Fetch all parameter analyses for this sc
+        # Fetch all parameter analyses for this sc (authoritative source)
         pas = list(_lims_col(LIMS_PA_COLLECTION).find({"sc": sc}))
 
-        # Group pa entries by pg (parameter group id)
-        pa_by_pg: Dict[str, List[Dict]] = {}
+        # Fetch all parameter groups for this sc (label lookup only)
+        pgs = list(_lims_col(LIMS_PG_COLLECTION).find({"sc": sc}))
+
+        # Map (sc, pg) -> pg document, for label lookup only
+        pg_by_key: Dict[str, Dict] = {
+            f"{pg.get('sc', '')}_{pg.get('pg', '')}": pg for pg in pgs
+        }
+
+        # Group pa results by their pg id -- this is now authoritative
+        grouped: Dict[str, List[Dict]] = {}
         for pa in pas:
-            pg_key = str(pa.get("sc", "")) + "_" + str(pa.get("pg", ""))
-            pa_by_pg.setdefault(pg_key, []).append(_mongo_doc_to_json(pa))
+            pg_key = f"{pa.get('sc', '')}_{pa.get('pg', '')}"
+            grouped.setdefault(pg_key, []).append(_mongo_doc_to_json(pa))
 
         compiled_pgs = []
-        for pg in pgs:
-            pg_key = str(pg.get("sc", "")) + "_" + str(pg.get("pg", ""))
-            compiled_pgs.append({
-                **_mongo_doc_to_json(pg),
-                "analyses": pa_by_pg.get(pg_key, []),
-            })
+        for pg_key, analyses in grouped.items():
+            pg_doc = pg_by_key.get(pg_key)
+            if pg_doc is not None:
+                group_entry = {**_mongo_doc_to_json(pg_doc), "analyses": analyses}
+            else:
+                # No lims_pg record for this group -- still show the results,
+                # falling back to the pa row's own description (or a generic
+                # label) for the header.
+                fallback_name = (
+                    analyses[0].get("description")
+                    or analyses[0].get("DESCRIPTION")
+                    or f"Parameter group {pg_key.split('_')[-1]}"
+                )
+                group_entry = {
+                    "PG_NAME": fallback_name,
+                    "parameter_group_name": fallback_name,
+                    "sc": sc,
+                    "pg": pg_key.split("_")[-1],
+                    "analyses": analyses,
+                    "_missing_pg_record": True,
+                }
+                print(
+                    f"[mongodb] WARNING: lims_pg record missing for sc={sc} "
+                    f"pg_key={pg_key!r} -- using fallback label {fallback_name!r}",
+                    file=sys.stderr,
+                )
+            compiled_pgs.append(group_entry)
 
         ad = sc_doc.get(_AD) or {}
         sc_value_str = str(ad.get("SC_VALUE") or "")
@@ -914,12 +944,7 @@ def get_product_detail(product_id: str) -> Optional[Dict[str, Any]]:
     Returns None if product_info not found.
     """
     try:
-        oid = ObjectId(product_id)
-    except InvalidId:
-        raise ValueError(f"Invalid product_id: {product_id}")
-
-    try:
-        info_doc = _col(PRODUCT_INFO_COLLECTION).find_one({"_id": oid})
+        info_doc = _col(PRODUCT_INFO_COLLECTION).find_one(_id_filter(product_id))
     except PyMongoError as exc:
         print(
             f"[mongodb] WARNING: get_product_detail lookup failed "
@@ -982,13 +1007,8 @@ def get_product_history(
     List of scan history entries, or None if product not found.
     """
     try:
-        oid = ObjectId(product_id)
-    except InvalidId:
-        raise ValueError(f"Invalid product_id: {product_id}")
-
-    try:
         info_doc = _col(PRODUCT_INFO_COLLECTION).find_one(
-            {"_id": oid},
+            _id_filter(product_id),
             {"scan_history": 1},
         )
     except PyMongoError as exc:

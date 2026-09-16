@@ -16,10 +16,18 @@ import type {
   ProductListFilters,
 } from '../types'
 
-const BASE_URL =
-  import.meta.env.VITE_API_URL ||
-  import.meta.env.VITE_API_BASE_URL ||
-  'http://localhost:8000'
+function getBaseUrl(): string {
+  const envUrl = import.meta.env.VITE_API_URL || import.meta.env.VITE_API_BASE_URL
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, '')
+  }
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    return `${window.location.protocol}//${window.location.hostname}:8000`
+  }
+  return 'http://localhost:8000'
+}
+
+const BASE_URL = getBaseUrl()
 
 export class ApiError extends Error {
   status: number

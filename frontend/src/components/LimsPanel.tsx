@@ -4,9 +4,9 @@ import { formatDate } from '../lib/format'
 
 // ── Analysis rendering helpers ────────────────────────────────────────────────
 
-const VALUE_KEYS = ['result', 'result_value', 'value', 'RESULT']
+const VALUE_KEYS = ['value_f', 'value_s', 'result', 'result_value', 'value', 'RESULT']
 const UNIT_KEYS  = ['unit', 'UNIT']
-const NAME_KEYS  = ['parameter_name', 'test_name', 'param_name', 'analysis_name', 'PA_NAME']
+const NAME_KEYS  = ['description', 'pa_desc', 'pa_name', 'parameter_name', 'test_name', 'param_name', 'analysis_name', 'PA_NAME']
 const LAB_KEYS   = ['parameter', 'method', 'instrument', 'lower_limit', 'upper_limit', 'limit']
 
 function displayName(a: Record<string, unknown>): string {
@@ -17,6 +17,10 @@ function displayName(a: Record<string, unknown>): string {
 }
 
 function findValue(a: Record<string, unknown>): string {
+  const vf = a['value_f']
+  if (typeof vf === 'number' && !Number.isNaN(vf)) {
+    return Number.isInteger(vf) ? String(vf) : String(vf)
+  }
   for (const k of VALUE_KEYS) {
     if (a[k] !== undefined && a[k] !== null && String(a[k]) !== '') return String(a[k])
   }
@@ -27,18 +31,26 @@ function findUnit(a: Record<string, unknown>): string {
   for (const k of UNIT_KEYS) {
     if (a[k]) return String(a[k])
   }
+  const ad = a['additional_data']
+  if (ad && typeof ad === 'object' && (ad as Record<string, unknown>)['UNIT']) {
+    return String((ad as Record<string, unknown>)['UNIT'])
+  }
   return ''
 }
 
 function extraFields(a: Record<string, unknown>): [string, string][] {
-  const used = new Set([...NAME_KEYS, ...VALUE_KEYS, ...UNIT_KEYS, LAB_KEYS[0]])
+  const used = new Set([
+    ...NAME_KEYS, ...VALUE_KEYS, ...UNIT_KEYS,
+    'pg', 'sc', 'pa', 'id', '_id',
+    'created_at', 'updated_at', 'assign_date',
+    'additional_data',
+  ])
   const extra: [string, string][] = []
   for (const [k, v] of Object.entries(a)) {
     if (used.has(k)) continue
     if (v === undefined || v === null) continue
-    const s = String(v)
+    const s = typeof v === 'object' ? '' : String(v)
     if (s === '' || s === 'Not Available') continue
-    if (k === 'pg' || k === 'sc' || k === '_id') continue
     extra.push([k, s])
   }
   return extra
