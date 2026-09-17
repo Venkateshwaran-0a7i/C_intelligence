@@ -20,6 +20,10 @@ API Endpoints
     GET  /products                  → paginated product list
     GET  /products/{product_id}     → full product detail + latest scan + LIMS
     GET  /products/{product_id}/history → scan timeline (lightweight or expanded)
+
+    POST /competitions               → create a frozen multi-brand comparison session
+    GET  /competitions               → list all competition sessions
+    GET  /competitions/{session_id}  → session detail + hydrated frozen snapshots
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import openai
 from dotenv import load_dotenv
@@ -76,6 +80,13 @@ class ConfirmProductBody(BaseModel):
     action: str  # "link" | "create_new"
     product_id: Optional[str] = None
     confirmed_by: str
+    is_competitor: Optional[bool] = None  # required when action == "create_new"
+
+
+class CreateCompetitionBody(BaseModel):
+    product_ids: List[str]
+    created_by: str
+    name: Optional[str] = None
 
 
 class LinkLimsBody(BaseModel):
@@ -189,6 +200,7 @@ async def extract(
     images: list[UploadFile] = File(...),
     model: str = Form(DEFAULT_MODEL),
     temperature: float = Form(1),
+    is_competitor: Optional[bool] = Form(None),
 ):
     """
     Upload product images → run extraction pipeline → store in product_data
@@ -256,7 +268,9 @@ async def extract(
             # Automatically match to an existing product or create a new one.
             # LIMS linking remains a separate, manual step.
             try:
-                link_result = auto_link_or_create_product(product_data_id)
+                link_result = auto_link_or_create_product(
+                    product_data_id, is_competitor=is_competitor
+                )
                 response["product_id"] = link_result["product_info"]["_id"]
                 response["product_action"] = link_result["action"]
                 response["match_score"] = link_result["match_score"]
@@ -360,6 +374,11 @@ async def confirm_product(body: ConfirmProductBody):
             status_code=422,
             detail="product_id is required when action is 'link'",
         )
+    if body.action == "create_new" and body.is_competitor is None:
+        raise HTTPException(
+            status_code=422,
+            detail="is_competitor is required when creating a new product.",
+        )
 
     try:
         result = confirm_product_match(
@@ -367,6 +386,7 @@ async def confirm_product(body: ConfirmProductBody):
             action=body.action,
             confirmed_by=body.confirmed_by,
             product_id=body.product_id,
+            is_competitor=body.is_competitor,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -452,6 +472,8 @@ async def list_products(
     is_competitor: Optional[bool] = Query(None),
     date_from: Optional[str] = Query(None, description="ISO date string, filter on latest_analyzed_at"),
     date_to: Optional[str] = Query(None, description="ISO date string, filter on latest_analyzed_at"),
+    search: Optional[str] = Query(None, description="Search product_name or brand"),
+    uploaded_data: Optional[str] = Query(None, description="has_images | missing_images | needs_review"),
 ):
     """
     Return all product_info documents (paginated), each enriched with:
@@ -473,7 +495,22 @@ async def list_products(
         is_competitor=is_competitor,
         date_from=date_from,
         date_to=date_to,
+        search=search,
+        uploaded_data=uploaded_data,
     )
+
+
+# ── 6b. GET /products/filter-options ───────────────────────────────────────────────
+# Must be registered BEFORE /products/{product_id} so FastAPI does not
+# interpret "filter-options" as a product_id path segment.
+
+@app.get("/products/filter-options", tags=["Products"])
+async def get_filter_options():
+    """Return distinct non-empty values for Business, Division, Brand, and
+    Product Category. Used by the frontend to populate filter dropdowns from
+    real catalogue data instead of free-text inputs."""
+    from src.db import get_distinct_filter_values
+    return get_distinct_filter_values()
 
 
 # ── 7. GET /products/{product_id} ─────────────────────────────────────────────
@@ -538,6 +575,67 @@ async def get_product_history(
             detail={"error": "Product not found", "product_id": product_id},
         )
     return {"product_id": product_id, "expand": expand, "history": history}
+
+
+# ── 9. POST /competitions ──────────────────────────────────────────────
+
+@app.post("/competitions", tags=["Competitions"])
+async def create_competition(body: CreateCompetitionBody):
+    """
+    Create a frozen multi-brand comparison session.
+
+    Resolves each product's latest scan to a ``product_data_id`` snapshot
+    at save time. Re-opening the session later always returns the data that
+    was current at creation — new scans added to those products do not
+    affect the saved comparison.
+
+    Requires exactly 2–4 ``product_ids``; returns 422 otherwise.
+    """
+    from src.db import create_competition_session
+
+    try:
+        return create_competition_session(
+            product_ids=body.product_ids,
+            created_by=body.created_by,
+            name=body.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+# ── 10. GET /competitions ──────────────────────────────────────────────
+
+@app.get("/competitions", tags=["Competitions"])
+async def list_competitions(limit: int = Query(100, ge=1, le=500)):
+    """
+    Return all competition sessions, most recent first.
+    Does not hydrate snapshot data — use GET /competitions/{id} for full detail.
+    """
+    from src.db import list_competition_sessions
+
+    return {"sessions": list_competition_sessions(limit=limit)}
+
+
+# ── 11. GET /competitions/{session_id} ───────────────────────────────────
+
+@app.get("/competitions/{session_id}", tags=["Competitions"])
+async def get_competition(session_id: str):
+    """
+    Return a competition session plus the full ``product_data`` document for
+    each frozen snapshot, reconstructed exactly as it was at save time.
+
+    The ``snapshots`` list is ordered to match ``snapshot_ids`` (and therefore
+    ``product_ids``) so the caller can zip them together.
+    """
+    from src.db import get_competition_session
+
+    result = get_competition_session(session_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "Competition session not found", "session_id": session_id},
+        )
+    return result
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

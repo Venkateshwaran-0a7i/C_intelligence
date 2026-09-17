@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   ArrowLeft,
-  Box,
   FlaskConical,
   LinkIcon,
   ServerCrash,
@@ -21,6 +20,7 @@ import LimsSearchModal from '../components/LimsSearchModal'
 import Timeline from '../components/Timeline'
 import EmptyState from '../components/EmptyState'
 import { SkeletonDetail } from '../components/Skeletons'
+import { ProductThumbnail } from '../components/ProductCard'
 
 type Tab = 'details' | 'lims' | 'timeline'
 
@@ -37,6 +37,12 @@ export default function ProductDetailPage() {
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('details')
   const [limsModalOpen, setLimsModalOpen] = useState(false)
+
+  // Tracks which specific scan the LIMS modal is targeting (from timeline or header button)
+  const [limsModalTarget, setLimsModalTarget] = useState<{
+    productDataId: string
+    currentSc: string | null
+  } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -94,7 +100,14 @@ export default function ProductDetailPage() {
   const info = detail.product_info
   const latest = detail.latest_product_data
   const limsResults = detail.lims_results
-  const latestScan = info.scan_history?.[0]
+
+  // Sort scan_history by analyzed_at descending so latestScan always matches
+  // detail.latest_product_data (which the backend selects via max analyzed_at),
+  // regardless of MongoDB insertion order.
+  const latestScan = [...(info.scan_history ?? [])].sort(
+    (a, b) => (b.analyzed_at ?? '').localeCompare(a.analyzed_at ?? ''),
+  )[0]
+
   const productDataId = latestScan?.product_data_id ?? ''
   const scanCount = info.scan_history?.length ?? 0
   const identity = latest?.product_identification
@@ -117,6 +130,28 @@ export default function ProductDetailPage() {
     { key: 'timeline', label: `Timeline (${scanCount})` },
   ]
 
+  /** Open the LIMS modal targeting a specific scan. */
+  const handleOpenLimsModal = (productDataId: string, currentSc: string | null) => {
+    setLimsModalTarget({ productDataId, currentSc })
+    setLimsModalOpen(true)
+  }
+
+  /** Open the LIMS modal targeting the latest scan (header / LIMS-tab shortcut). */
+  const handleOpenLimsModalForLatest = () => {
+    handleOpenLimsModal(productDataId, latestScan?.lims_sc_value ?? null)
+  }
+
+  const handleLimsClose = () => {
+    setLimsModalOpen(false)
+    setLimsModalTarget(null)
+  }
+
+  const handleLimsAttached = () => {
+    setLimsModalOpen(false)
+    setLimsModalTarget(null)
+    void load()
+  }
+
   return (
     <div className="mx-auto max-w-5xl space-y-4 px-4 py-6">
       <Link
@@ -129,9 +164,7 @@ export default function ProductDetailPage() {
 
       {/* Header */}
       <div className="flex items-start gap-4 rounded-xl border border-slate-200 bg-white p-5">
-        <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-400">
-          <Box className="h-9 w-9" />
-        </div>
+        <ProductThumbnail imageId={info.first_uploaded_image} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-xl font-semibold text-slate-900">
@@ -157,11 +190,11 @@ export default function ProductDetailPage() {
             <span className="text-xs text-slate-400">
               {scanCount} scan{scanCount === 1 ? '' : 's'} recorded
             </span>
-            {/* Always-visible LIMS link shortcut in the header */}
+            {/* Always-visible LIMS link shortcut in the header (targets latest scan) */}
             {productDataId && (
               <button
                 type="button"
-                onClick={() => setLimsModalOpen(true)}
+                onClick={handleOpenLimsModalForLatest}
                 className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:border-teal-400 hover:text-teal-700"
               >
                 <LinkIcon className="h-3 w-3" />
@@ -276,7 +309,7 @@ export default function ProductDetailPage() {
             </div>
             <div className="rounded-xl border border-slate-200 bg-white p-5">
               <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-500">
-                Manufacturing & pricing
+                Manufacturing &amp; pricing
               </h3>
               <dl className="space-y-4">
                 <FieldValue
@@ -329,7 +362,7 @@ export default function ProductDetailPage() {
             <div className="flex justify-end">
               <button
                 type="button"
-                onClick={() => setLimsModalOpen(true)}
+                onClick={handleOpenLimsModalForLatest}
                 className="inline-flex items-center gap-1.5 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700"
               >
                 <LinkIcon className="h-4 w-4" />
@@ -350,7 +383,7 @@ export default function ProductDetailPage() {
                   productDataId ? (
                     <button
                       type="button"
-                      onClick={() => setLimsModalOpen(true)}
+                      onClick={handleOpenLimsModalForLatest}
                       className="inline-flex items-center gap-1 rounded-md border border-teal-600 bg-teal-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-teal-700"
                     >
                       <LinkIcon className="h-4 w-4" />
@@ -367,19 +400,20 @@ export default function ProductDetailPage() {
       {tab === 'timeline' && (
         <Timeline
           entries={history}
+          productId={info._id}
+          onLinkLims={(pdId, currentSc) => handleOpenLimsModal(pdId, currentSc)}
         />
       )}
 
-      {limsModalOpen && productDataId && (
+      {limsModalOpen && limsModalTarget && (
         <LimsSearchModal
           productId={info._id}
-          productDataId={productDataId}
+          productDataId={limsModalTarget.productDataId}
           defaultQuery={limsModalQuery}
-          onClose={() => setLimsModalOpen(false)}
-          onAttached={() => {
-            setLimsModalOpen(false)
-            void load()
-          }}
+          business={info.business}
+          division={info.division}
+          onClose={handleLimsClose}
+          onAttached={handleLimsAttached}
         />
       )}
     </div>

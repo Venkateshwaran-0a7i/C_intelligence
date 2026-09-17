@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { CheckCircle2, ChevronDown, ChevronUp, History } from 'lucide-react'
 import type { ExpandedHistoryEntry } from '../types'
 import { formatDateTime } from '../lib/format'
+import { LimsParameterGroups } from './LimsPanel'
 
 function LimsStatusBadge({ entry }: { entry: ExpandedHistoryEntry }) {
   return entry.lims_sc_value ? (
@@ -45,8 +46,12 @@ function summary(entry: ExpandedHistoryEntry) {
 
 export default function Timeline({
   entries,
+  productId: _productId,
+  onLinkLims,
 }: {
   entries: ExpandedHistoryEntry[]
+  productId: string
+  onLinkLims: (productDataId: string, currentSc: string | null) => void
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
@@ -106,6 +111,18 @@ export default function Timeline({
 
             {isOpen && (
               <div className="border-t border-slate-100 px-4 py-3">
+                {/* ── Link / Replace LIMS button ── */}
+                <div className="mb-3 flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={() => onLinkLims(entry.product_data_id, entry.lims_sc_value ?? null)}
+                    className="inline-flex items-center gap-1 rounded-md border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50"
+                  >
+                    {entry.lims_sc_value ? 'Replace LIMS sample' : 'Link LIMS sample'}
+                  </button>
+                </div>
+
+                {/* ── Claims / Ingredients summary ── */}
                 {s ? (
                   <div className="space-y-3">
                     <div>
@@ -161,6 +178,22 @@ export default function Timeline({
                   <p className="text-sm italic text-slate-400">
                     Full scan data not available.
                   </p>
+                )}
+
+                {/* ── Inline LIMS parameter groups (if linked) ── */}
+                {entry.lims_sc_value && (
+                  <div className="mt-3 border-t border-slate-100 pt-3">
+                    <h5 className="mb-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
+                      Lab results for this scan
+                    </h5>
+                    {entry.lims_results?.parameter_groups?.length ? (
+                      <LimsParameterGroups groups={entry.lims_results.parameter_groups} />
+                    ) : (
+                      <p className="text-sm italic text-slate-400">
+                        Sample linked, but no parameter results are available yet.
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
             )}

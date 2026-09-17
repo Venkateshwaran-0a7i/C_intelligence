@@ -1,146 +1,98 @@
 # SYSTEM OBJECTIVE
-Fix `frontend/src/components/LimsPanel.tsx` so it correctly reads the
-real field names present in `lims_pa` documents, instead of looking for
-field names that don't exist in this data -- which currently causes
-every test to render as "Untitled test" with no value, followed by a
-noisy dump of internal fields including a broken "[object Object]" line.
+Run a full verification pass against the live GptModel system, checking
+every requirement and every fix made so far. For each item below, either
+confirm PASS with evidence (a specific screen, response, or query
+result), or report FAIL with what was actually observed. Do not mark
+anything PASS based on code inspection alone if it can be checked by
+actually running the flow — this is a runtime verification, not a code
+review.
 
 # TECHNICAL ENVIRONMENT
-- Frontend: React + TypeScript, `frontend/src/components/LimsPanel.tsx`
-- Data source: MongoDB `lims_pa` collection, populated from `lims_pa.csv`
+- Backend: FastAPI on :8000, MongoDB (`Competition_intelligence` +
+  `lims` databases)
+- Frontend: React + Vite on :5173
+- Reference docs: `SYSTEM_DESIGN.md`, `collection_structure_reference.md`
 
-# CONFIRMED ROOT CAUSE
-Actual shape of a `lims_pa` document, confirmed directly against the
-source CSV (example: sc=44026, pa=382):
+---
 
-    {
-      "id": 115347,
-      "sc": 44026.0,
-      "pg": 49.0,
-      "pa": 382.0,
-      "description": "GC profile for Flavours & Seasonings",
-      "pa_name": null,
-      "pa_desc": null,
-      "value_f": 100.0,
-      "value_s": "100.00",
-      "created_at": "2026-08-19 21:07:56.210560",
-      "updated_at": "2026-08-19 21:07:56.210561",
-      "assign_date": null,
-      "additional_data": {
-        "SC": 44026, "PA": 382, "VALUE_F": 100.0, "UNIT": null,
-        "DESCRIPTION": "GC profile for Flavours & Seasonings",
-        "PA_SHORT_DESC": "GC profile FnS", "PA_NAME": null,
-        "PG": 49, "PA_DESC": null, "ASSIGN_DATE": null,
-        "VALUE_S": "100.00"
-      }
-    }
+## A. Repository (original requirement #1)
 
-Current code in LimsPanel.tsx looks for the WRONG key names:
+| # | Check | How to verify | Pass criteria |
+|---|---|---|---|
+| A1 | Product + ingredient data stored centrally | Upload a product, then `GET /products/{id}` | Full extracted JSON returned, matches what was on the package |
+| A2 | Data is never deleted / immutable snapshots | Inspect `product_data` collection document count before/after a normal browsing session | Count only ever increases, never decreases from read operations |
+| A3 | 6+ months retention | Query `product_data` for documents older than 6 months (if any exist) | None have been purged; no TTL index silently deleting old scans |
+| A4 | Search and filter the repository | See section B | — |
 
-    const VALUE_KEYS = ['result', 'result_value', 'value', 'RESULT']
-    const UNIT_KEYS  = ['unit', 'UNIT']
-    const NAME_KEYS  = ['parameter_name', 'test_name', 'param_name', 'analysis_name', 'PA_NAME']
+## B. Search & Filters (original requirement #2)
 
-None of these match the real top-level fields (`description`, `value_f`,
-`value_s`), so:
-- `displayName()` finds nothing -> renders "Untitled test"
-- `findValue()` finds nothing -> renders blank value
-- `extraFields()` doesn't exclude `id`, `pa`, `created_at`, `updated_at`,
-  `assign_date`, `additional_data` -> all of them get dumped as raw
-  "extra fields", including `String(additional_data)` which produces
-  the literal text "[object Object]" since `additional_data` is a
-  nested object, not a string.
+| # | Check | Currently implemented? | Pass criteria |
+|---|---|---|---|
+| B1 | Business filter | Yes — dropdown in `FilterBar.tsx` | Selecting a business narrows `GET /products` results correctly |
+| B2 | Division filter | Yes — free-text input | Typing a division narrows results correctly |
+| B3 | Brand filter | Yes — free-text input | Typing a brand narrows results correctly |
+| B4 | **Product Category filter** | **NOT FOUND in `FilterBar.tsx` or `list_products()` params** | FLAG AS GAP — confirm whether `product_category` is even queryable via `GET /products` today |
+| B5 | Product / Competition Product filter | Yes — "Scope: All / Own product / Competitor" toggle | Selecting "Own product" or "Competitor" correctly filters by `is_competitor` |
+| B6 | **From Date & To Date filter** | **NOT FOUND in current FilterBar** | FLAG AS GAP — `list_products()` may support `date_from`/`date_to` params server-side per earlier design, but no UI control exists to set them |
+| B7 | **Period filter (preset ranges)** | **NOT FOUND** | FLAG AS GAP — no "Last 30 days / Last quarter / Last year" preset exists anywhere |
+| B8 | **"Uploaded data" filter** | **Ambiguous — never clarified what this means** | FLAG AS OPEN QUESTION — confirm with the requirement source whether this means filtering by upload source (`api`/`cli`/`batch`), by whether an image exists, or something else, before implementing |
+| B9 | Search box behavior | Current search is labeled "Search this page…" | CONFIRM: is this searching only the currently-loaded page of results (client-side), or the full catalogue server-side? If client-side only, this under-delivers on "search the stored data" — flag if so |
 
-# REQUIRED FIX
-Replace the key-list constants and `extraFields()` exclusion set in
-LimsPanel.tsx exactly as follows:
+**Action needed on this section**: B4, B6, B7 are real gaps requiring
+new UI (and possibly backend query params) before requirement #2 can be
+called complete. B8 needs clarification before it can be verified at all.
 
-    const VALUE_KEYS = ['value_f', 'value_s', 'result', 'result_value', 'value', 'RESULT']
-    const UNIT_KEYS  = ['unit', 'UNIT']
-    const NAME_KEYS  = ['description', 'pa_desc', 'pa_name', 'parameter_name', 'test_name', 'param_name', 'analysis_name', 'PA_NAME']
+## C. Competition Tracker (replaces original requirement #3, "Historical Comparison")
 
-Update `findUnit()` to also check inside `additional_data` when no
-top-level unit field is present, since `UNIT` sometimes only exists
-there:
+| # | Check | How to verify | Pass criteria |
+|---|---|---|---|
+| C1 | Periodic competition — view a product's own history over time | Open a product with 2+ scans, check Timeline tab | Every scan listed, chronological, each showing its own LIMS status |
+| C2 | Each scan can carry its own independent LIMS link | Link different `sc_value`s to two different scans of the same product (per the per-timestamp fix) | Both links persist independently; viewing each scan shows its own correct parameters |
+| C3 | Multi-brand competition — select 2-4 products, compare | `POST /competitions` with 2-4 `product_ids` | Session created, `snapshot_ids` populated |
+| C4 | Frozen snapshots don't drift | Create a session, then upload a new scan for one of the compared products, then `GET /competitions/{id}` again | Session still shows the ORIGINAL snapshot data, unaffected by the new scan |
+| C5 | Session rejects invalid product counts | `POST /competitions` with 1 or 5 product_ids | Both rejected with 422 |
 
-    function findUnit(a: Record<string, unknown>): string {
-      for (const k of UNIT_KEYS) {
-        if (a[k]) return String(a[k])
-      }
-      const ad = a['additional_data']
-      if (ad && typeof ad === 'object' && (ad as Record<string, unknown>)['UNIT']) {
-        return String((ad as Record<string, unknown>)['UNIT'])
-      }
-      return ''
-    }
+## D. LIMS Integration (original requirement #4)
 
-Update `findValue()` so a numeric `value_f` is preferred and formatted
-without a trailing `.0` for whole numbers, falling back to `value_s`:
+| # | Check | How to verify | Pass criteria |
+|---|---|---|---|
+| D1 | Link LIMS test results to the respective product | Use "Link a LIMS sample" on a product | `scan_history` entry gets a `lims_sc_value` |
+| D2 | Store relevant LIMS and product information together | `GET /products/{id}` | Response includes both product identity AND compiled LIMS results in one payload |
+| D3 | Map products with the LIMS Sample ID | Confirm the join is via `sc_value`, not free-text `description` | `link_lims_sample()` validates against `lims_sc.sc_value`, not fuzzy text matching |
+| D4 | Final mapping between Business, Division, Product, and LIMS is confirmed (not guessed) | Attempt to link LIMS without explicit user action (check `auto_link_or_create_product`) | LIMS linking is NEVER automatic — always requires an explicit `POST /product-data/{id}/lims` call with a human-chosen `sc_value`; product-to-product matching MAY be automatic (score ≥ 70) but LIMS linking never is |
+| D5 | LIMS results render correctly, including pending tests | Open a product whose sample has unresulted tests | Table shows "Pending" badges, not blank rows or bare test-name lists |
+| D6 | LIMS join doesn't silently drop results when `lims_pg` is missing | Open the Cavin's Vanilla Milkshake / SC20260818-27 case | The "GC profile for Flavours & Seasonings" result still renders |
 
-    function findValue(a: Record<string, unknown>): string {
-      const vf = a['value_f']
-      if (typeof vf === 'number' && !Number.isNaN(vf)) {
-        return Number.isInteger(vf) ? String(vf) : String(vf)
-      }
-      for (const k of VALUE_KEYS) {
-        if (a[k] !== undefined && a[k] !== null && String(a[k]) !== '') return String(a[k])
-      }
-      return ''
-    }
+---
 
-Update `extraFields()`'s exclusion set to hide all internal/bookkeeping
-fields that should never be shown as a raw "extra field" row -- this is
-the fix for the "[object Object]" line and the id/created_at/updated_at
-clutter:
+## E. Data integrity / matching safety (from the dedup work)
 
-    function extraFields(a: Record<string, unknown>): [string, string][] {
-      const used = new Set([
-        ...NAME_KEYS, ...VALUE_KEYS, ...UNIT_KEYS,
-        'pg', 'sc', 'pa', 'id', '_id',
-        'created_at', 'updated_at', 'assign_date',
-        'additional_data',
-      ])
-      const extra: [string, string][] = []
-      for (const [k, v] of Object.entries(a)) {
-        if (used.has(k)) continue
-        if (v === undefined || v === null) continue
-        const s = typeof v === 'object' ? '' : String(v)
-        if (s === '' || s === 'Not Available') continue
-        extra.push([k, s])
-      }
-      return extra
-    }
+| # | Check | How to verify | Pass criteria |
+|---|---|---|---|
+| E1 | No fuzzy barcode matching in production matching logic | Inspect `find_product_candidates()` / `pair_score()` | Only exact barcode match awards points; no edit-distance logic present |
+| E2 | Variant mismatch penalty active | Attempt to auto-link two same-brand, same-name, different-variant products | They do NOT merge (score drops below threshold) |
+| E3 | `is_competitor` required on new products | `POST /products/confirm` with `action: create_new` and no `is_competitor` | Rejected with 422, not silently created |
+| E4 | `is_competitor` never overwritten on link | Link a new scan to an existing product, passing a different `is_competitor` value | Existing product's `is_competitor` is unchanged |
+| E5 | Every `product_info` doc has `first_uploaded_image`, `merged_from`, `needs_manual_review` | Sample a few documents directly from MongoDB | All three keys present on every document (null/[]/false at minimum) |
 
-The `typeof v === 'object' ? '' : String(v)` guard is a defensive
-backstop: even if a future field turns out to be an object, it will be
-silently skipped rather than rendering "[object Object]" again.
+## F. Upload flow
 
-# DATA MODELS & SCHEMAS -- no backend or type changes required
-`LimsResults` / analysis types in frontend/src/types do not need
-changes -- these are all runtime key lookups against
-`Record<string, unknown>`, matching the existing pattern in the file.
+| # | Check | How to verify | Pass criteria |
+|---|---|---|---|
+| F1 | Extract → auto-link/create → optional LIMS link, in one flow | Upload a new product image end-to-end | Reaches a product detail page with correct identity and (if chosen) LIMS link |
+| F2 | Camera capture available | Open Upload page, click "Take photo" | Camera permission requested; captured photo added to the same file list as browsed files |
+| F3 | Extraction still works via drag-and-drop / browse (regression check) | Upload via file picker | Unaffected by the camera addition |
 
-# EDGE CASES & FAILURE MITIGATIONS
-- **`value_f` is 0** (a real, meaningful zero result): the `typeof vf
-  === 'number'` check correctly still returns `"0"`, since it does not
-  treat falsy-but-valid numbers as missing.
-- **Both `value_f` and `value_s` are null** (test not yet resulted):
-  `findValue()` falls through to `''`, and the existing JSX already
-  handles an empty value by rendering nothing extra next to the name --
-  confirm this still reads cleanly rather than showing a dangling unit.
-- **`additional_data` is missing entirely** on some documents:
-  `findUnit()`'s optional chaining-style check (`ad && typeof ad ===
-  'object'`) safely returns `''` rather than throwing.
-- **A genuinely new/unexpected object-typed field appears later**: the
-  `extraFields()` guard skips it instead of stringifying it into
-  "[object Object]" again.
+---
 
-# VERIFICATION
-1. Reload the Cavin's Vanilla Milkshake "Lab results (LIMS)" tab.
-   Confirm the test now shows the name "GC profile for Flavours &
-   Seasonings" and the value "100" (not "Untitled test" / blank).
-2. Confirm the extra-fields area no longer shows `Id`, `Additional
-   Data: [object Object]`, `Created At`, `Pa`, or `Updated At`.
-3. Find or create a lims_pa row that has a real `UNIT` value nested in
-   `additional_data` (not null) and confirm it now renders next to the
-   value, e.g. "6.4 pH" or similar.
+# REPORTING FORMAT
+For each item, report:
+
+    [PASS] A2 — product_data count went 103 → 104 after one upload, never decreased.
+    [FAIL] B4 — no Product Category control exists in FilterBar.tsx; GET /products has no product_category query param wired to the UI.
+    [GAP]  B8 — "Uploaded data" filter meaning was never defined; cannot verify until clarified.
+
+Group the final output into three lists: **Confirmed working**,
+**Confirmed broken / missing**, and **Needs clarification before it can
+be verified at all** — so the next work session has a clear, ordered
+punch list instead of a wall of mixed results.

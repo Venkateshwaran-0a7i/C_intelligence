@@ -1,5 +1,5 @@
 import { Calendar, FlaskConical, Hash } from 'lucide-react'
-import type { LimsResults } from '../types'
+import type { LimsResults, LimsParameterGroup } from '../types'
 import { formatDate } from '../lib/format'
 
 // ── Analysis rendering helpers ────────────────────────────────────────────────
@@ -38,22 +38,134 @@ function findUnit(a: Record<string, unknown>): string {
   return ''
 }
 
-function extraFields(a: Record<string, unknown>): [string, string][] {
-  const used = new Set([
-    ...NAME_KEYS, ...VALUE_KEYS, ...UNIT_KEYS,
-    'pg', 'sc', 'pa', 'id', '_id',
-    'created_at', 'updated_at', 'assign_date',
-    'additional_data',
-  ])
-  const extra: [string, string][] = []
-  for (const [k, v] of Object.entries(a)) {
-    if (used.has(k)) continue
-    if (v === undefined || v === null) continue
-    const s = typeof v === 'object' ? '' : String(v)
-    if (s === '' || s === 'Not Available') continue
-    extra.push([k, s])
+/** Coerce any item to a plain trimmed string (mirrors Timeline.tsx toText). */
+function toText(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v.trim()
+  if (typeof v === 'object' && 'value' in (v as object))
+    return String((v as { value?: unknown }).value ?? '').trim()
+  return String(v).trim()
+}
+
+// ── Structured table types ────────────────────────────────────────────────────
+
+interface ParamRow {
+  name: string
+  value: string
+  unit: string
+  status: 'resulted' | 'pending'
+}
+
+function buildRow(a: Record<string, unknown>): ParamRow {
+  const name =
+    toText(a['description']) ||
+    toText(a['pa_desc']) ||
+    toText(a['pa_name']) ||
+    toText(a['parameter_name']) ||
+    toText(a['test_name']) ||
+    toText(a['param_name']) ||
+    toText(a['analysis_name']) ||
+    toText(a['PA_NAME']) ||
+    'Untitled test'
+  const value = findValue(a)
+  const unit = findUnit(a)
+  // value_f: 0 is a real result — findValue() returns '0' via the
+  // typeof-number check, so value !== '' and status is 'resulted'.
+  return { name, value, unit, status: value === '' ? 'pending' : 'resulted' }
+}
+
+function StatusBadge({ status }: { status: ParamRow['status'] }) {
+  return status === 'resulted' ? (
+    <span className="inline-flex items-center rounded-full border border-teal-200 bg-teal-50 px-2 py-0.5 text-[11px] font-medium text-teal-700">
+      Resulted
+    </span>
+  ) : (
+    <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-600">
+      Pending
+    </span>
+  )
+}
+
+// ── Shared parameter-group renderer ──────────────────────────────────────────
+
+export function LimsParameterGroups({ groups }: { groups: LimsParameterGroup[] }) {
+  if (groups.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white px-6 py-10 text-center">
+        <FlaskConical className="mb-2 h-8 w-8 text-slate-300" />
+        <p className="text-sm text-slate-500">
+          No parameter results are available for this sample yet.
+        </p>
+      </div>
+    )
   }
-  return extra
+
+  return (
+    <div className="space-y-4">
+      {groups.map((group, gi) => {
+        const groupName =
+          String(group.PG_NAME ?? group.parameter_group_name ?? '').trim() ||
+          `Group ${gi + 1}`
+        const analyses = group.analyses ?? []
+
+        if (analyses.length === 0) {
+          return (
+            <div key={gi} className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+              <div className="border-b border-slate-100 bg-slate-50 px-4 py-2.5">
+                <h4 className="text-sm font-semibold text-slate-800">{groupName}</h4>
+              </div>
+              <p className="px-4 py-3 text-sm italic text-slate-400">
+                No tests assigned to this group.
+              </p>
+            </div>
+          )
+        }
+
+        const rows = analyses.map(buildRow)
+        const resultedCount = rows.filter((r) => r.status === 'resulted').length
+
+        return (
+          <div key={gi} className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+            {/* Group header */}
+            <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-4 py-2.5">
+              <h4 className="text-sm font-semibold text-slate-800">{groupName}</h4>
+              <span className="text-xs text-slate-500">
+                {resultedCount} / {rows.length} resulted
+              </span>
+            </div>
+
+            {/* Results table */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 text-left text-xs font-medium uppercase tracking-wide text-slate-400">
+                    <th className="px-4 py-2">Parameter</th>
+                    <th className="px-4 py-2">Value</th>
+                    <th className="px-4 py-2">Unit</th>
+                    <th className="px-4 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {rows.map((row, ri) => (
+                    <tr key={ri} className="hover:bg-slate-50/50">
+                      <td className="px-4 py-2.5 text-slate-700">{row.name}</td>
+                      <td className="px-4 py-2.5 font-mono text-slate-900">
+                        {row.value || '—'}
+                      </td>
+                      <td className="px-4 py-2.5 text-slate-500">{row.unit || '—'}</td>
+                      <td className="px-4 py-2.5">
+                        <StatusBadge status={row.status} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -115,67 +227,8 @@ export default function LimsPanel({ limsResults }: { limsResults: LimsResults })
         </div>
       </div>
 
-      {/* ── Parameter groups or empty state ──────────────────────────────── */}
-      {groups.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-white px-6 py-10 text-center">
-          <FlaskConical className="mb-2 h-8 w-8 text-slate-300" />
-          <p className="text-sm text-slate-500">
-            No parameter results are available for this sample yet.
-          </p>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {groups.map((group, i) => {
-            const groupName =
-              String(group.PG_NAME ?? group.parameter_group_name ?? '').trim() ||
-              `Group ${i + 1}`
-            const analyses = group.analyses ?? []
-            return (
-              <div key={i} className="overflow-hidden rounded-xl border border-slate-200 bg-white">
-                <h4 className="border-b border-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-800">
-                  {groupName}
-                </h4>
-                <ul className="divide-y divide-slate-100">
-                  {analyses.map((a, j) => {
-                    const name  = displayName(a)
-                    const value = findValue(a)
-                    const unit  = findUnit(a)
-                    const extra = extraFields(a)
-                    return (
-                      <li key={j} className="px-4 py-2.5">
-                        <div className="flex items-baseline justify-between gap-4">
-                          <span className="text-sm text-slate-700">
-                            {name || <span className="italic text-slate-400">Untitled test</span>}
-                          </span>
-                          <span className="whitespace-nowrap font-mono text-sm text-slate-900">
-                            {value}
-                            {unit ? <span className="ml-1 text-slate-500">{unit}</span> : null}
-                          </span>
-                        </div>
-                        {extra.length > 0 && (
-                          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5">
-                            {extra.map(([k, v]) => (
-                              <span key={k} className="text-xs text-slate-400">
-                                <span className="capitalize">{k.replace(/_/g, ' ')}:</span>{' '}
-                                <span className="font-mono text-slate-500">{v}</span>
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </li>
-                    )
-                  })}
-                  {analyses.length === 0 && (
-                    <li className="px-4 py-3 text-sm italic text-slate-400">
-                      No analyses in this group.
-                    </li>
-                  )}
-                </ul>
-              </div>
-            )
-          })}
-        </div>
-      )}
+      {/* ── Parameter groups ──────────────────────────────────────────────── */}
+      <LimsParameterGroups groups={groups} />
     </div>
   )
 }

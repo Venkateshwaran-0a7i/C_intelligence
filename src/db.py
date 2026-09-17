@@ -44,6 +44,11 @@ LIMS_SC_COLLECTION = os.environ.get("LIMS_SC_COLLECTION", "lims_sc")
 LIMS_PG_COLLECTION = os.environ.get("LIMS_PG_COLLECTION", "lims_pg")
 LIMS_PA_COLLECTION = os.environ.get("LIMS_PA_COLLECTION", "lims_pa")
 
+# competition_sessions — frozen multi-brand comparison snapshots
+COMPETITION_SESSIONS_COLLECTION = os.environ.get(
+    "COMPETITION_SESSIONS_COLLECTION", "competition_sessions"
+)
+
 # Kept for backward-compat with CLI usage (console output only)
 MONGO_COLLECTION = PRODUCT_DATA_COLLECTION
 
@@ -287,12 +292,13 @@ def find_product_candidates(
     Search ``product_info`` for candidate matches using a weighted scoring system.
 
     Scoring:
-        barcode exact match:         +50
+        barcode exact match:         +50  (exact only — no fuzzy/edit-distance)
         brand exact match:           +30 | brand substring: +15
         name exact match:            +40 | name substring:  +20
         variant exact match:         +15 | variant substring: +5
         variant clear mismatch:      -40  (both non-empty, neither contains the other)
         net_quantity exact match:    +15
+        net_quantity clear mismatch: -20  (both non-empty but different)
 
     Returns
     -------
@@ -327,7 +333,10 @@ def find_product_candidates(
         doc_qty = _normalize(doc.get("net_quantity", ""))
         doc_barcode = _normalize(doc.get("barcode", ""))
 
-        # Barcode — highest weight, stops comparison ambiguity
+        # Barcode — highest weight, exact only.
+        # Fuzzy/edit-distance barcode matching is explicitly rejected: this
+        # manufacturer uses sequential SKU numbering so near-identical barcodes
+        # do NOT reliably indicate the same product.
         if q_barcode and doc_barcode and q_barcode == doc_barcode:
             score += 50
 
@@ -356,8 +365,12 @@ def find_product_candidates(
                 score -= 40
 
         # Net quantity
-        if q_qty and doc_qty and q_qty == doc_qty:
-            score += 15
+        if q_qty and doc_qty:
+            if q_qty == doc_qty:
+                score += 15
+            else:
+                # Both non-empty but different → clear mismatch
+                score -= 20
 
         if score >= 30:
             results.append({
@@ -378,7 +391,10 @@ def find_product_candidates(
 AUTO_LINK_SCORE_THRESHOLD = 70
 
 
-def auto_link_or_create_product(product_data_id: str) -> Dict[str, Any]:
+def auto_link_or_create_product(
+    product_data_id: str,
+    is_competitor: Optional[bool] = None,
+) -> Dict[str, Any]:
     """
     Automatically link a product_data scan to an existing product_info document,
     or create a new one if no confident match exists.
@@ -423,6 +439,7 @@ def auto_link_or_create_product(product_data_id: str) -> Dict[str, Any]:
             action="link",
             confirmed_by="system-auto",
             product_id=top["product_id"],
+            is_competitor=is_competitor,  # accepted but ignored on link path
         )
         return {
             "product_info": result,
@@ -434,6 +451,7 @@ def auto_link_or_create_product(product_data_id: str) -> Dict[str, Any]:
             product_data_id=product_data_id,
             action="create_new",
             confirmed_by="system-auto",
+            is_competitor=is_competitor,
         )
         return {
             "product_info": result,
@@ -472,6 +490,7 @@ def confirm_product_match(
     action: str,  # "link" | "create_new"
     confirmed_by: str,
     product_id: Optional[str] = None,
+    is_competitor: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Confirm a product match either by linking to an existing product_info document
@@ -487,11 +506,22 @@ def confirm_product_match(
         Username / identifier of the person confirming.
     product_id : str, optional
         Required when action == ``"link"``.
+    is_competitor : bool, optional
+        Required when action == ``"create_new"``.
+        When action == ``"link"`` this parameter is accepted but ignored --
+        the existing product_info document's classification is never overwritten.
 
     Returns
     -------
     Updated or newly created product_info document (as dict), or None on error.
     """
+    # Validate is_competitor before touching the database
+    if action == "create_new" and is_competitor is None:
+        raise ValueError(
+            "is_competitor must be specified when creating a new product "
+            "(true = competitor product, false = own product)."
+        )
+
     # Fetch the product_data document to get analyzed_at
     pd_doc = get_product_data(product_data_id)
     if pd_doc is None:
@@ -514,6 +544,9 @@ def confirm_product_match(
             if not product_id:
                 raise ValueError("product_id is required when action is 'link'")
 
+            # is_competitor is intentionally NOT updated here — the existing
+            # product's classification was set at creation and must not be
+            # silently overwritten by a mismatched value passed in a link call.
             result = col.find_one_and_update(
                 _id_filter(product_id),
                 {"$push": {"scan_history": scan_entry}},
@@ -527,20 +560,22 @@ def confirm_product_match(
             identity = _extract_identity_fields(pd_doc)
             now = _now_iso()
 
-            # Derive the first uploaded image filename from metadata
+            # Store the GridFS ID of the first image so the frontend can call
+            # GET /images/{gridfs_id} directly. The schema says
+            # metadata.images[0].gridfs_id is the canonical display image source.
             first_image = ""
             images = pd_doc.get("metadata", {}).get("images", [])
             if images:
-                first_image = images[0].get("filename", "")
-            else:
-                filenames = pd_doc.get("metadata", {}).get("image_filenames", [])
-                first_image = filenames[0] if filenames else ""
+                first_image = images[0].get("gridfs_id", "") or images[0].get("filename", "")
 
             new_doc: Dict[str, Any] = {
                 **identity,
                 "normalized_product_name": _normalize(identity["product_name"]),
                 "normalized_brand": _normalize(identity["brand"]),
                 "first_uploaded_image": first_image,
+                "is_competitor": is_competitor,
+                "merged_from": [],
+                "needs_manual_review": False,
                 "created_at": now,
                 "scan_history": [scan_entry],
             }
@@ -743,6 +778,8 @@ def list_products(
     is_competitor: Optional[bool] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    uploaded_data: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Return paginated product_info documents enriched with:
@@ -765,6 +802,23 @@ def list_products(
         match_stage["product_category"] = {"$regex": re.escape(product_category), "$options": "i"}
     if is_competitor is not None:
         match_stage["is_competitor"] = is_competitor
+    if search:
+        pattern = {"$regex": re.escape(search), "$options": "i"}
+        match_stage["$or"] = [
+            {"product_name": pattern},
+            {"brand": pattern},
+        ]
+    # Uploaded-data quality filter
+    if uploaded_data == "has_images":
+        match_stage["first_uploaded_image"] = {"$exists": True, "$nin": [None, ""]}
+    elif uploaded_data == "missing_images":
+        match_stage["$or"] = match_stage.get("$or", []) + [
+            {"first_uploaded_image": {"$exists": False}},
+            {"first_uploaded_image": None},
+            {"first_uploaded_image": ""},
+        ]
+    elif uploaded_data == "needs_review":
+        match_stage["needs_manual_review"] = True
     if match_stage:
         pipeline.append({"$match": match_stage})
 
@@ -839,6 +893,27 @@ def list_products(
             file=sys.stderr,
         )
         return {"total": 0, "page": page, "page_size": page_size, "items": []}
+
+
+def get_distinct_filter_values() -> Dict[str, List[str]]:
+    """Return sorted distinct non-empty/non-placeholder values for each
+    filterable field, used to populate frontend filter dropdowns."""
+    col = _col(PRODUCT_INFO_COLLECTION)
+    skip = {None, "", "Not Available"}
+    return {
+        "businesses": sorted(
+            v for v in col.distinct("business") if v not in skip
+        ),
+        "divisions": sorted(
+            v for v in col.distinct("division") if v not in skip
+        ),
+        "brands": sorted(
+            v for v in col.distinct("brand") if v not in skip
+        ),
+        "product_categories": sorted(
+            v for v in col.distinct("product_category") if v not in skip
+        ),
+    }
 
 
 # ── Product detail ───────────────────────────────────────────────────────────
@@ -1043,3 +1118,153 @@ def get_product_history(
         expanded.append(record)
 
     return expanded
+
+
+# ── Competition sessions ─────────────────────────────────────────────────────
+
+def create_competition_session(
+    product_ids: List[str],
+    created_by: str,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Freeze a multi-brand comparison at the current moment.
+
+    Resolves each product's LATEST scan_history entry to a product_data_id
+    at save time and stores it in ``snapshot_ids``. The snapshot is never
+    re-resolved after creation, so a saved comparison never silently drifts
+    as new scans come in for those products.
+
+    Parameters
+    ----------
+    product_ids : list of str
+        2 to 4 product_info document _ids to compare.
+    created_by : str
+        Username / identifier of the person creating the session.
+    name : str, optional
+        Human-readable label for the session.
+
+    Returns
+    -------
+    The newly created competition_sessions document (as dict).
+
+    Raises
+    ------
+    ValueError
+        If the number of product_ids is outside the 2–4 range, if a
+        product_info document is not found, or if a product has no scans.
+    """
+    if not (2 <= len(product_ids) <= 4):
+        raise ValueError(
+            f"A competition session requires 2 to 4 products, got {len(product_ids)}."
+        )
+
+    snapshot_ids: List[str] = []
+    category_signature: Optional[Dict[str, Any]] = None
+
+    try:
+        for pid in product_ids:
+            info = _col(PRODUCT_INFO_COLLECTION).find_one(_id_filter(pid))
+            if info is None:
+                raise ValueError(f"product_info not found: {pid}")
+
+            history = sorted(
+                info.get("scan_history", []),
+                key=lambda e: e.get("analyzed_at") or "",
+            )
+            if not history:
+                raise ValueError(f"product {pid} has no scans to snapshot.")
+
+            snapshot_ids.append(history[-1]["product_data_id"])
+
+            if category_signature is None:
+                category_signature = {
+                    "business": info.get("business"),
+                    "division": info.get("division"),
+                    "product_category": info.get("product_category"),
+                }
+
+        doc: Dict[str, Any] = {
+            "name": name,
+            "product_ids": product_ids,
+            "snapshot_ids": snapshot_ids,
+            "category_signature": category_signature,
+            "created_by": created_by,
+            "created_at": _now_iso(),
+        }
+        inserted = _col(COMPETITION_SESSIONS_COLLECTION).insert_one(doc)
+        doc["_id"] = str(inserted.inserted_id)
+        return doc
+
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: create_competition_session failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        raise
+
+
+def get_competition_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Return a competition session plus the full product_data for each frozen
+    snapshot, reconstructed exactly as it was at save time.
+
+    The ``snapshots`` list is ordered to match ``snapshot_ids`` (and therefore
+    ``product_ids``) so the caller can zip them together.
+
+    Returns None if the session is not found.
+    """
+    try:
+        oid = ObjectId(session_id)
+    except Exception:
+        return None
+
+    try:
+        doc = _col(COMPETITION_SESSIONS_COLLECTION).find_one({"_id": oid})
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: get_competition_session failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return None
+
+    if doc is None:
+        return None
+
+    doc = _mongo_doc_to_json(doc)
+    doc["snapshots"] = [
+        get_product_data(pdid) for pdid in doc.get("snapshot_ids", [])
+    ]
+    return doc
+
+
+def list_competition_sessions(limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Return competition sessions, most recent first.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of sessions to return (default 100).
+
+    Returns
+    -------
+    List of competition_sessions documents (as dicts, no hydrated snapshots).
+    """
+    try:
+        cursor = (
+            _col(COMPETITION_SESSIONS_COLLECTION)
+            .find({})
+            .sort("created_at", DESCENDING)
+            .limit(limit)
+        )
+        return [_mongo_doc_to_json(d) for d in cursor]
+    except PyMongoError as exc:
+        print(
+            f"[mongodb] WARNING: list_competition_sessions failed "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return []

@@ -51,6 +51,15 @@ export interface ProductListFilters {
   is_competitor?: boolean
   date_from?: string
   date_to?: string
+  search?: string
+  uploaded_data?: string
+}
+
+export interface FilterOptions {
+  businesses: string[]
+  divisions: string[]
+  brands: string[]
+  product_categories: string[]
 }
 
 // ── GET /products/{id} (get_product_detail) ─────────────────────────────────

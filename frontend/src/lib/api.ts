@@ -5,6 +5,7 @@ import type {
   AttachLimsBody,
   ConfirmProductBody,
   ExtractResponse,
+  FilterOptions,
   HealthResponse,
   LimsAdminRow,
   LimsSearchResult,
@@ -92,6 +93,8 @@ export const api = {
     const q = toQuery({ ...filters })
     return request<PaginatedProducts>(`/products${q ? `?${q}` : ''}`)
   },
+
+  getFilterOptions: () => request<FilterOptions>('/products/filter-options'),
 
   getProductDetail: (productId: string) =>
     request<ProductDetailResponse>(`/products/${encodeURIComponent(productId)}`),

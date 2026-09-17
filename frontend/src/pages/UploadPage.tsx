@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Box,
+  Camera,
   CheckCircle,
   FlaskConical,
   ImagePlus,
@@ -25,12 +26,29 @@ function cleanValue(value?: string): string | undefined {
 
 export default function UploadPage() {
   const inputRef = useRef<HTMLInputElement>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
   const navigate = useNavigate()
 
   const [files, setFiles] = useState<File[]>([])
   const [stage, setStage] = useState<Stage>('idle')
   const [error, setError] = useState<string | null>(null)
   const [extractResult, setExtractResult] = useState<ExtractResponse | null>(null)
+  const [cameraOpen, setCameraOpen] = useState(false)
+
+  // Attach the live stream to the video element once the overlay is mounted.
+  useEffect(() => {
+    if (cameraOpen && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current
+    }
+  }, [cameraOpen])
+
+  // Stop the camera stream on unmount (e.g. navigating away mid-capture).
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((t) => t.stop())
+    }
+  }, [])
 
   const addFiles = (list: FileList | null) => {
     if (!list) return
@@ -40,6 +58,47 @@ export default function UploadPage() {
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index))
   }
+
+  // ── Camera handlers ──────────────────────────────────────────────────────────
+
+  const openCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false,
+      })
+      streamRef.current = stream
+      setCameraOpen(true)
+      // Actual srcObject assignment happens in the useEffect above,
+      // after the video element is rendered.
+    } catch {
+      setError('Could not access the camera. Check browser permissions.')
+    }
+  }
+
+  const closeCamera = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop())
+    streamRef.current = null
+    setCameraOpen(false)
+  }
+
+  const capturePhoto = () => {
+    const video = videoRef.current
+    if (!video) return
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(video, 0, 0)
+    canvas.toBlob((blob) => {
+      if (!blob) return
+      const file = new File([blob], `capture-${Date.now()}.jpg`, { type: 'image/jpeg' })
+      setFiles((prev) => [...prev, file])
+    }, 'image/jpeg', 0.92)
+  }
+
+  // ── Extract handler ──────────────────────────────────────────────────────────
 
   const handleExtract = async () => {
     if (files.length === 0) return
@@ -93,13 +152,23 @@ export default function UploadPage() {
             <p className="text-sm text-slate-600">
               Drag and drop product packaging images here, or
             </p>
-            <button
-              type="button"
-              onClick={() => inputRef.current?.click()}
-              className="mt-3 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-            >
-              Browse files
-            </button>
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => inputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                Browse files
+              </button>
+              <button
+                type="button"
+                onClick={() => void openCamera()}
+                className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                <Camera className="h-4 w-4" />
+                Take photo
+              </button>
+            </div>
             <input
               ref={inputRef}
               type="file"
@@ -145,6 +214,34 @@ export default function UploadPage() {
             </div>
           )}
         </>
+      )}
+
+      {/* ── Camera overlay ──────────────────────────────────────────────────── */}
+      {cameraOpen && (
+        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            className="max-h-[70vh] rounded-lg"
+          />
+          <div className="mt-4 flex gap-3">
+            <button
+              type="button"
+              onClick={capturePhoto}
+              className="rounded-full bg-white px-5 py-2.5 text-sm font-medium text-slate-900 hover:bg-slate-100"
+            >
+              Capture
+            </button>
+            <button
+              type="button"
+              onClick={closeCamera}
+              className="rounded-full border border-white px-5 py-2.5 text-sm font-medium text-white hover:bg-white/10"
+            >
+              Done
+            </button>
+          </div>
+        </div>
       )}
 
       {/* ── Extracting: spinner ─────────────────────────────────────────────── */}
